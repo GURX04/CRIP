@@ -1,0 +1,20 @@
+# CRIP: Cloud Resource & Invoicing Platform / Pipeline
+
+An end-to-end framework for local cloud infrastructure emulation, load simulation, telemetry collection, machine learning cost anomaly detection, and automated remediation.
+
+## Quick CLI Usage (`crip`)
+
+After installing in editable mode (`pip install -e .`), manage the entire project with:
+
+```bash
+crip --help                 # List all available commands
+crip up                     # Launch LocalStack, TimescaleDB, Prometheus, Target App
+crip down                   # Stop containers
+crip cur                    # Generate 24h synthetic AWS Cost & Usage Report CSV
+crip ingest                 # Ingest CUR & Prometheus telemetry into TimescaleDB
+crip detect                 # Run Prophet ML anomaly detection
+crip detect-v2              # Run Ensemble ML anomaly detection (Z-score + IF + Prophet)
+crip deploy-remediation     # Package & deploy Lambda dry-run remediation to LocalStack
+crip pipeline               # Run full pipeline: up -> ingest -> deploy -> detect
+crip status                 # Check container health status
+```

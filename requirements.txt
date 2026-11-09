@@ -1,0 +1,29 @@
+# ============================================================
+# Host-side Python dependencies — Phase 1 + Phase 2 + Phase 3
+# Install with:  pip install -r requirements.txt
+# ============================================================
+
+# Task Runner & CLI (crip)
+invoke>=2.0.0
+
+# Load testing (Phase 1)
+locust
+
+# AWS CLI (optional — LocalStack interaction)
+awscli==1.33.18
+awscli-local==0.22.0
+
+# TimescaleDB / PostgreSQL driver (Phase 2)
+psycopg2-binary
+
+# HTTP client — Prometheus API queries (Phase 2)
+requests==2.32.3
+
+# Phase 3 — Machine Learning & Anomaly Detection
+pandas>=2.0
+prophet>=1.1.5
+matplotlib>=3.8
+sqlalchemy>=2.0
+
+# Utilities (already stdlib — listed for documentation)
+# csv, math, random, datetime, argparse, uuid, json, logging, warnings

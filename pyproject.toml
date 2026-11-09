@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crip"
+version = "0.1.0"
+description = "Cloud Resource & Invoicing Platform / Pipeline CLI"
+authors = [
+    { name = "CRIP Platform Team" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "invoke>=2.0.0",
+]
+
+[project.scripts]
+crip = "crip_cli:main"
+
+[tool.setuptools]
+py-modules = ["crip_cli", "tasks"]

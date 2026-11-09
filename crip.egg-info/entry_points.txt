@@ -1,0 +1,2 @@
+[console_scripts]
+crip = crip_cli:main

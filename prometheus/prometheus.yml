@@ -1,0 +1,81 @@
+# =============================================================================
+# prometheus/prometheus.yml
+# CRIP Phase 2 — Prometheus scrape configuration
+# =============================================================================
+
+global:
+  # How frequently Prometheus collects metrics from targets
+  scrape_interval:     15s
+
+  # Timeout per individual scrape
+  scrape_timeout:      10s
+
+  # How often Prometheus evaluates alerting/recording rules
+  evaluation_interval: 15s
+
+  # Labels attached to every time series scraped by THIS Prometheus instance
+  external_labels:
+    environment: "local-dev"
+    project:     "crip"
+    phase:       "2"
+
+# =============================================================================
+# Rule files (none yet — add recording/alerting rules here in Phase 3)
+# =============================================================================
+rule_files: []
+
+# =============================================================================
+# Scrape configurations
+# Each job maps to one logical group of targets.
+# =============================================================================
+scrape_configs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1 — Prometheus self-monitoring
+  # Exposes: prometheus_tsdb_* , prometheus_http_* , go_* metrics
+  # ---------------------------------------------------------------------------
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          service: "prometheus"
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — Node Exporter (host OS metrics)
+  # Exposes: node_cpu_*, node_memory_*, node_disk_*, node_network_* etc.
+  # Container name resolves via the shared Docker bridge network (crip_net).
+  # ---------------------------------------------------------------------------
+  - job_name: "node_exporter"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["node_exporter:9100"]
+        labels:
+          service:  "node_exporter"
+          instance: "crip-host"
+
+  # ---------------------------------------------------------------------------
+  # Job 3 — CRIP Target Application (FastAPI + prometheus_client)
+  # Exposes: crip_http_requests_total, crip_http_request_duration_seconds,
+  #          crip_http_errors_total, crip_active_requests,
+  #          crip_ingest_bytes_total, crip_app_uptime_seconds
+  # ---------------------------------------------------------------------------
+  - job_name: "crip_target_app"
+    scrape_interval: 10s       # more frequent — this is our primary SLI source
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["target_app:8080"]
+        labels:
+          service:  "crip-target-app"
+          instance: "target-app-01"
+
+  # ---------------------------------------------------------------------------
+  # Job 4 — LocalStack (exposes basic HTTP metrics on /metrics if available)
+  # Disabled by default — uncomment if your LocalStack build supports it.
+  # ---------------------------------------------------------------------------
+  # - job_name: "localstack"
+  #   scrape_interval: 30s
+  #   metrics_path: "/metrics"
+  #   static_configs:
+  #     - targets: ["localstack:4566"]
+  #       labels:
+  #         service: "localstack"

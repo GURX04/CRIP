@@ -1,0 +1,10 @@
+README.md
+crip_cli.py
+pyproject.toml
+tasks.py
+crip.egg-info/PKG-INFO
+crip.egg-info/SOURCES.txt
+crip.egg-info/dependency_links.txt
+crip.egg-info/entry_points.txt
+crip.egg-info/requires.txt
+crip.egg-info/top_level.txt

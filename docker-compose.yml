@@ -1,0 +1,152 @@
+# ============================================================
+# CRIP — Phase 1 + Phase 2 Full Stack
+# Services: LocalStack, Target App, Prometheus,
+#           Node Exporter, TimescaleDB
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # LocalStack: emulates AWS (S3, DynamoDB, API GW, Lambda)
+  # ----------------------------------------------------------
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: localstack
+    restart: unless-stopped
+    ports:
+      - "4566:4566"
+      - "4510-4559:4510-4559"
+    environment:
+      - SERVICES=s3,dynamodb,apigateway,lambda,iam,logs,events
+      - PERSIST_DATA=1
+      - DEBUG=0
+      - DEFAULT_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - EDGE_PORT=4566
+      - LAMBDA_EXECUTOR=local
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - crip_net
+
+  # ----------------------------------------------------------
+  # Target App: FastAPI micro-service (Phase 2: Prometheus)
+  # ----------------------------------------------------------
+  target_app:
+    build:
+      context: ./target_app
+      dockerfile: Dockerfile
+    container_name: target_app
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_ENV=local
+      - APP_PORT=8080
+    depends_on:
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crip_net
+
+  # ----------------------------------------------------------
+  # Node Exporter: host-level OS / hardware metrics
+  # Prometheus scrapes this at node_exporter:9100/metrics
+  # ----------------------------------------------------------
+  node_exporter:
+    image: prom/node-exporter:v1.8.1
+    container_name: node_exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    networks:
+      - crip_net
+
+  # ----------------------------------------------------------
+  # Prometheus: metrics collection and storage (15-day TSDB)
+  # ----------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - node_exporter
+      - target_app
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crip_net
+
+  # ----------------------------------------------------------
+  # TimescaleDB: PostgreSQL 16 + TimescaleDB extension
+  # Used to store CUR line-items and system telemetry
+  # ----------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: timescaledb
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=crip
+      - POSTGRES_USER=crip_user
+      - POSTGRES_PASSWORD=crip_secret
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crip_user -d crip"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - crip_net
+
+# ----------------------------------------------------------
+# Named Volumes
+# ----------------------------------------------------------
+volumes:
+  localstack_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  timescaledb_data:
+    driver: local
+
+# ----------------------------------------------------------
+# Networks
+# ----------------------------------------------------------
+networks:
+  crip_net:
+    driver: bridge
