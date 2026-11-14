@@ -1,0 +1,13 @@
+# ============================================================
+# pipeline/requirements.txt
+# Dependencies for the CRIP Streaming Detector & Evaluator
+# ============================================================
+
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+redis>=5.0.0
+numpy>=1.26.0
+structlog>=24.1.0
+psycopg2-binary>=2.9.9
+prometheus-client>=0.20.0
+

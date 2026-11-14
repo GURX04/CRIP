@@ -1,5 +1,5 @@
 # ============================================================
-# Host-side Python dependencies — Phase 1 + Phase 2 + Phase 3
+# Host-side Python dependencies — Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5
 # Install with:  pip install -r requirements.txt
 # ============================================================
 
@@ -24,6 +24,24 @@ pandas>=2.0
 prophet>=1.1.5
 matplotlib>=3.8
 sqlalchemy>=2.0
+
+# Phase 4 — Continuous Event Generator
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+redis>=5.0.0
+numpy>=1.26.0
+structlog>=24.1.0
+prometheus-client>=0.20.0
+
+# Phase 5 — Live Dashboard
+httpx>=0.27.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+fakeredis>=2.21.0
 
 # Utilities (already stdlib — listed for documentation)
 # csv, math, random, datetime, argparse, uuid, json, logging, warnings

@@ -1,0 +1,25 @@
+# ============================================================
+# generator/requirements.txt
+# Dependencies for the CRIP event generator Docker image
+# ============================================================
+
+# Web framework + ASGI server
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Settings management
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# Redis client (async-capable; we use sync pipeline)
+redis>=5.0.0
+
+# Numerical / random
+numpy>=1.26.0
+
+# Structured logging
+structlog>=24.1.0
+
+# TimescaleDB / PostgreSQL driver
+psycopg2-binary>=2.9.9
+

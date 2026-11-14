@@ -123,13 +123,151 @@ services:
       - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
-      - ./timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./timescaledb/init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./timescaledb/002_add_injections.sql:/docker-entrypoint-initdb.d/002_add_injections.sql:ro
+      - ./timescaledb/003_add_pipeline_tables.sql:/docker-entrypoint-initdb.d/003_add_pipeline_tables.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U crip_user -d crip"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 30s
+    networks:
+      - crip_net
+
+  # ----------------------------------------------------------
+  # Redis: event stream broker for the generator
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - crip_net
+
+  # ----------------------------------------------------------
+  # Generator: continuous cost-event emitter + control API
+  # ----------------------------------------------------------
+  generator:
+    build:
+      context: .
+      dockerfile: generator/Dockerfile
+    container_name: generator
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - GEN_SINK=redis
+      - GEN_REDIS_URL=redis://redis:6379
+      - GEN_DB_DSN=postgresql://crip_user:crip_secret@timescaledb:5432/crip
+      - GEN_SIM_MINUTES_PER_REAL_SECOND=5
+      - GEN_SEED=42
+      - GEN_API_HOST=0.0.0.0
+      - GEN_API_PORT=8000
+      - GEN_GROUND_TRUTH_PATH=/app/reports/ground_truth.jsonl
+    volumes:
+      - ./reports:/app/reports
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/state"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - crip_net
+
+  # ----------------------------------------------------------
+  # Detector: real-time streaming anomaly detection worker
+  # ----------------------------------------------------------
+  detector:
+    build:
+      context: .
+      dockerfile: pipeline/Dockerfile
+    container_name: detector
+    restart: unless-stopped
+    ports:
+      - "9200:9200"
+    environment:
+      - PIP_REDIS_URL=redis://redis:6379
+      - PIP_DB_DSN=postgresql://crip_user:crip_secret@timescaledb:5432/crip
+      - PIP_METRICS_PORT=9200
+      - PIP_WARMUP_TICKS=20
+    volumes:
+      - ./pipeline:/app/pipeline:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - crip_net
+
+  # ----------------------------------------------------------
+  # Evaluator: real-time ground truth matching & accuracy metrics
+  # ----------------------------------------------------------
+  evaluator:
+    build:
+      context: .
+      dockerfile: pipeline/Dockerfile
+    container_name: evaluator
+    restart: unless-stopped
+    command: ["python", "-m", "pipeline.evaluator"]
+    environment:
+      - PIP_REDIS_URL=redis://redis:6379
+      - PIP_EVAL_REDIS_URL=redis://redis:6379
+    volumes:
+      - ./pipeline:/app/pipeline:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - crip_net
+
+  # ----------------------------------------------------------
+  # Dashboard: live demo UI + SSE fan-out backend
+  # ----------------------------------------------------------
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - DASH_HOST=0.0.0.0
+      - DASH_PORT=8501
+      - DASH_REDIS_URL=redis://redis:6379
+      - DASH_GENERATOR_URL=http://generator:8000
+      - DASH_DB_DSN=postgresql://crip_user:crip_secret@timescaledb:5432/crip
+      - DASH_LOG_LEVEL=INFO
+    volumes:
+      - ./reports:/app/reports
+      - ./dashboard:/app/dashboard:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      generator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
       - crip_net
 
