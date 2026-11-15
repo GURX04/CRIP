@@ -199,18 +199,28 @@ def create_app(settings: Optional[DashboardSettings] = None) -> FastAPI:
                 except Exception:
                     pass
 
-            # Proposals stream
-            proposals: list[HistoryProposal] = []
+            # Proposals stream — keep only the latest snapshot per proposal
+            latest_proposals: dict[str, HistoryProposal] = {}
             raw = r.xrevrange(settings.redis_stream_proposals, count=200)
-            for _id, fields in reversed(raw):
+
+            # XREVRANGE returns newest records first.
+            for _id, fields in raw:
                 try:
                     d = json.loads(fields.get("payload", "{}"))
-                    proposals.append(HistoryProposal(**{
+                    proposal_id = d.get("proposal_id")
+
+                    if not proposal_id or proposal_id in latest_proposals:
+                        continue
+
+                    latest_proposals[proposal_id] = HistoryProposal(**{
                         k: v for k, v in d.items()
                         if k in HistoryProposal.model_fields
-                    }))
+                    })
                 except Exception:
                     pass
+
+            # Restore chronological order for the dashboard.
+            proposals = list(reversed(list(latest_proposals.values())))
 
         except Exception as exc:
             log.warning("history redis error: %s — returning empty", exc)
@@ -349,52 +359,52 @@ def create_app(settings: Optional[DashboardSettings] = None) -> FastAPI:
 
         return {"mode": mode, "kill_switch": kill_switch}
 
+    
     @app.post("/api/remediation/proposals/{proposal_id}/approve")
     async def approve_remediation_proposal(proposal_id: str):
-        """Approve a pending proposal and apply in generator."""
+        """Queue approval for the remediation worker."""
         try:
             import redis as redis_lib  # noqa: PLC0415
-            r = redis_lib.from_url(settings.redis_url, decode_responses=True)
-            # Find proposal payload from stream
+
+            r = redis_lib.from_url(
+                settings.redis_url,
+                decode_responses=True,
+            )
+
             raw = r.xrevrange(settings.redis_stream_proposals, count=100)
             target_proposal = None
+
             for _id, fields in raw:
                 try:
-                    d = json.loads(fields.get("payload", "{}"))
-                    if d.get("proposal_id") == proposal_id:
-                        target_proposal = d
+                    data = json.loads(fields.get("payload", "{}"))
+                    if data.get("proposal_id") == proposal_id:
+                        target_proposal = data
                         break
                 except Exception:
-                    pass
+                    continue
 
             if not target_proposal:
-                raise HTTPException(status_code=404, detail=f"Proposal {proposal_id} not found")
+                raise HTTPException(status_code=404, detail="Proposal not found")
 
-            # Call generator /mitigate to enforce action
-            factor = float(target_proposal.get("params", {}).get("factor", 0.6))
-            duration = float(target_proposal.get("params", {}).get("duration_min", 30.0))
-            service = target_proposal.get("service", "all")
-
-            async with httpx.AsyncClient(timeout=settings.generator_timeout_s) as client:
-                resp = await client.post(
-                    f"{settings.generator_url}/mitigate",
-                    json={
-                        "service": service,
-                        "type": "rate_limit",
-                        "factor": factor,
-                        "duration_min": duration,
-                        "mitigation_id": proposal_id,
-                    },
+            if target_proposal.get("status") != "pending_approval":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Proposal is not pending approval",
                 )
-                if resp.status_code >= 400:
-                    raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
-            # Update proposal status to APPLIED
-            target_proposal["status"] = "applied"
-            target_proposal["remediation_id"] = proposal_id
-            r.xadd(settings.redis_stream_proposals, {"payload": json.dumps(target_proposal)}, maxlen=10000)
+            r.xadd(
+                "crip:remediation_approvals",
+                {
+                    "payload": json.dumps({
+                        "proposal_id": proposal_id,
+                        "action": "approve",
+                    })
+                },
+                maxlen=10000,
+            )
 
-            return {"proposal_id": proposal_id, "status": "applied"}
+            return {"proposal_id": proposal_id, "status": "approval_queued"}
+
         except HTTPException:
             raise
         except Exception as exc:
@@ -402,31 +412,54 @@ def create_app(settings: Optional[DashboardSettings] = None) -> FastAPI:
 
     @app.post("/api/remediation/proposals/{proposal_id}/reject")
     async def reject_remediation_proposal(proposal_id: str):
-        """Reject a pending proposal."""
+        """Queue rejection for the remediation worker."""
         try:
             import redis as redis_lib  # noqa: PLC0415
-            r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+
+            r = redis_lib.from_url(
+                settings.redis_url,
+                decode_responses=True,
+            )
+
             raw = r.xrevrange(settings.redis_stream_proposals, count=100)
             target_proposal = None
+
             for _id, fields in raw:
                 try:
-                    d = json.loads(fields.get("payload", "{}"))
-                    if d.get("proposal_id") == proposal_id:
-                        target_proposal = d
+                    data = json.loads(fields.get("payload", "{}"))
+                    if data.get("proposal_id") == proposal_id:
+                        target_proposal = data
                         break
                 except Exception:
-                    pass
+                    continue
 
-            if target_proposal:
-                target_proposal["status"] = "rejected"
-                r.xadd(settings.redis_stream_proposals, {"payload": json.dumps(target_proposal)}, maxlen=10000)
+            if not target_proposal:
+                raise HTTPException(status_code=404, detail="Proposal not found")
 
-            return {"proposal_id": proposal_id, "status": "rejected"}
+            if target_proposal.get("status") != "pending_approval":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Proposal is not pending approval",
+                )
+
+            r.xadd(
+                "crip:remediation_approvals",
+                {
+                    "payload": json.dumps({
+                        "proposal_id": proposal_id,
+                        "action": "reject",
+                    })
+                },
+                maxlen=10000,
+            )
+
+            return {"proposal_id": proposal_id, "status": "rejection_queued"}
+
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
-    # -----------------------------------------------------------------------
-    # Root — serve SPA
     # -----------------------------------------------------------------------
 
     @app.get("/", response_class=HTMLResponse)

@@ -41,10 +41,11 @@ class RemediationGuardrails:
         self.settings = settings or get_remediation_settings()
         self._kill_switch: bool = self.settings.kill_switch
 
-        # Tracking state (simulated time)
-        self._service_last_action_ts: Dict[str, datetime] = {}
-        self._global_action_timestamps: List[datetime] = []
+        # Tracking state (isolated by simulation run)
+        self._service_last_action_ts: Dict[Tuple[str, str], datetime] = {}
+        self._global_action_timestamps: Dict[str, List[datetime]] = {}
         self._active_mitigations: Dict[str, RemediationProposal] = {}
+        
 
     @property
     def kill_switch(self) -> bool:
@@ -69,6 +70,7 @@ class RemediationGuardrails:
         """
         decisions: List[GuardrailDecision] = []
         now = sim_ts or proposal.sim_ts or datetime.now(tz=timezone.utc)
+        run_id = proposal.run_id or "default"
 
         # Non-executable action types (informational only)
         if proposal.action in (ActionType.INVESTIGATE_CONFIG, ActionType.ALERT_ONLY):
@@ -141,20 +143,29 @@ class RemediationGuardrails:
         # 4. Per-Service Cooldown
         # -------------------------------------------------------------------
         svc = proposal.service
-        if svc in self._service_last_action_ts:
-            last_ts = self._service_last_action_ts[svc]
-            elapsed_min = (now - last_ts).total_seconds() / 60.0
-            if elapsed_min < self.settings.cooldown_sim_min:
-                remaining = self.settings.cooldown_sim_min - elapsed_min
-                decisions.append(GuardrailDecision(
-                    guardrail="service_cooldown",
-                    allowed=False,
-                    reason=(
-                        f"Service '{svc}' is in cooldown. Last action was {elapsed_min:.1f} "
-                        f"sim-min ago; {remaining:.1f} min remaining."
-                    ),
-                ))
-                return False, decisions, ProposalStatus.BLOCKED_BY_GUARDRAIL
+        service_key = (run_id, svc)
+
+        if service_key in self._service_last_action_ts:
+            last_ts = self._service_last_action_ts[service_key]
+
+            # Ignore stale timestamps if simulation time moved backwards.
+            if now < last_ts:
+                self._service_last_action_ts.pop(service_key, None)
+            else:
+                elapsed_min = (now - last_ts).total_seconds() / 60.0
+
+                if elapsed_min < self.settings.cooldown_sim_min:
+                    remaining = self.settings.cooldown_sim_min - elapsed_min
+                    decisions.append(GuardrailDecision(
+                        guardrail="service_cooldown",
+                        allowed=False,
+                        reason=(
+                            f"Service '{svc}' is in cooldown. Last action was "
+                            f"{elapsed_min:.1f} sim-min ago; "
+                            f"{remaining:.1f} min remaining."
+                        ),
+                    ))
+                    return False, decisions, ProposalStatus.BLOCKED_BY_GUARDRAIL
 
         decisions.append(GuardrailDecision(
             guardrail="service_cooldown",
@@ -166,8 +177,14 @@ class RemediationGuardrails:
         # 5. Global Hourly Rate Cap
         # -------------------------------------------------------------------
         one_hour_ago = now - timedelta(hours=1)
-        recent_actions = [t for t in self._global_action_timestamps if t >= one_hour_ago]
-        self._global_action_timestamps = recent_actions  # prune old
+
+        run_actions = self._global_action_timestamps.get(run_id, [])
+        recent_actions = [
+            t for t in run_actions
+            if one_hour_ago <= t <= now
+        ]
+
+        self._global_action_timestamps[run_id] = recent_actions
 
         if len(recent_actions) >= self.settings.max_actions_per_hour:
             decisions.append(GuardrailDecision(
@@ -183,7 +200,10 @@ class RemediationGuardrails:
         decisions.append(GuardrailDecision(
             guardrail="global_rate_cap",
             allowed=True,
-            reason=f"Global rate cap satisfied ({len(recent_actions)}/{self.settings.max_actions_per_hour} used).",
+            reason=(
+                f"Global rate cap satisfied "
+                f"({len(recent_actions)}/{self.settings.max_actions_per_hour} used)."
+            ),
         ))
 
         # -------------------------------------------------------------------
@@ -226,8 +246,10 @@ class RemediationGuardrails:
     def record_action_applied(self, proposal: RemediationProposal, sim_ts: Optional[datetime] = None) -> None:
         """Update cooldown and rate limit timestamps after an action is applied."""
         now = sim_ts or proposal.sim_ts or datetime.now(tz=timezone.utc)
-        self._service_last_action_ts[proposal.service] = now
-        self._global_action_timestamps.append(now)
+        run_id = proposal.run_id or "default"
+
+        self._service_last_action_ts[(run_id, proposal.service)] = now
+        self._global_action_timestamps.setdefault(run_id, []).append(now)
         self._active_mitigations[proposal.proposal_id] = proposal
 
     def record_action_ended(self, proposal_id: str) -> None:

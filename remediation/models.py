@@ -25,6 +25,7 @@ class ProposalStatus(str, Enum):
     PROPOSED = "proposed"
     PENDING_APPROVAL = "pending_approval"
     APPLIED = "applied"
+    EXPIRED = "expired"
     BLOCKED_BY_GUARDRAIL = "blocked_by_guardrail"
     ROLLED_BACK = "rolled_back"
     REJECTED = "rejected"

@@ -12,6 +12,7 @@ import threading
 import time
 from collections import OrderedDict
 from typing import Optional
+from dataclasses import replace
 
 import redis
 import redis.exceptions
@@ -116,6 +117,7 @@ class Consumer:
     ) -> None:
         self._settings = settings
         self._ensemble = ensemble
+        self._active_detection_ids: dict[str, Detection] = {}
         self._publisher = publisher
         self._db_writer = db_writer
 
@@ -340,6 +342,8 @@ class Consumer:
 
         # 8. Detection fanout
         if detection is not None:
+            self._active_detection_ids[event.service] = detection
+
             log.warning(
                 "detection_fired",
                 detection_id=detection.detection_id,
@@ -350,6 +354,27 @@ class Consumer:
             )
             self._publisher.publish_detection(detection)
             self._db_writer.enqueue_detection(detection)
+
+        # Emit closure after the ensemble cooldown expires.
+        status = self._ensemble.update_detection_status(
+            event.service, event.tick_index
+        )
+
+        if status == "closed":
+            active = self._active_detection_ids.pop(event.service, None)
+
+            if active is not None:
+                closed_detection = replace(active, status="closed")
+
+                self._publisher.publish_detection(closed_detection)
+                self._db_writer.enqueue_detection(closed_detection)
+
+                log.info(
+                    "detection_closed",
+                    detection_id=closed_detection.detection_id,
+                    service=closed_detection.service,
+                )
+
 
         # 9. Mark seen
         self._dedup.add(event.event_id)
