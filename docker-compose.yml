@@ -30,6 +30,7 @@ services:
     volumes:
       - localstack_data:/var/lib/localstack
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./timescaledb/004_add_remediation_tables.sql:/docker-entrypoint-initdb.d/004_add_remediation_tables.sql:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
       interval: 10s
@@ -205,6 +206,7 @@ services:
       - PIP_DB_DSN=postgresql://crip_user:crip_secret@timescaledb:5432/crip
       - PIP_METRICS_PORT=9200
       - PIP_WARMUP_TICKS=20
+      - PIP_VOTE_THRESHOLD=1
     volumes:
       - ./pipeline:/app/pipeline:ro
     depends_on:

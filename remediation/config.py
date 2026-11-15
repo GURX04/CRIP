@@ -50,6 +50,14 @@ class RemediationSettings(BaseSettings):
         default="crip:remediation_proposals",
         description="Stream to publish remediation proposals to.",
     )
+    redis_stream_approvals: str = Field(
+        default="crip:remediation_approvals",
+        description="Stream for dashboard approval and rejection commands.",
+    )
+    redis_stream_mitigations: str = Field(
+        default="crip:mitigations",
+        description="Stream for generator mitigation lifecycle events.",
+    )
     redis_stream_results: str = Field(
         default="crip:remediation_results",
         description="Stream to publish remediation results & impact to.",

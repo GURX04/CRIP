@@ -255,7 +255,7 @@ class PipelineSettings(BaseSettings):
     # ------------------------------------------------------------------
 
     cooldown_ticks: int = Field(
-        default=10,
+        default=1440,
         description=(
             "After a Detection is emitted for a service, suppress further "
             "detections on that service for this many ticks."

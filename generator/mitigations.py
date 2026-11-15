@@ -1,15 +1,8 @@
+
 """
 generator/mitigations.py
 ========================
 Mitigation management for the CRIP event generator.
-
-Provides:
-- Mitigation dataclass representing active or scheduled rate-limits / throttles.
-- MitigationRegistry managing active mitigations across ticks.
-
-A mitigation multiplies the request volume (and therefore cost) of a service
-by `factor` (e.g. 0.6 = 40% reduction).
-Mitigations are logged to the Redis stream `crip:mitigations` upon start and end.
 """
 
 from __future__ import annotations
@@ -26,22 +19,8 @@ from generator.config import VALID_SERVICE_NAMES
 
 @dataclass
 class Mitigation:
-    """
-    A live mitigation applied to one service or 'all'.
+    """A live mitigation applied to one service or 'all'."""
 
-    Attributes
-    ----------
-    mitigation_id:
-        Unique identifier (defaults to uuid4 string).
-    service:
-        Target service name or 'all'.
-    type:
-        Mitigation type (default 'rate_limit').
-    factor:
-        Traffic multiplier (> 0.0 and <= 1.0). e.g., 0.6 means 40% reduction.
-    duration_min:
-        Simulated minutes this mitigation should remain active.
-    """
     service: str
     factor: float
     duration_min: float
@@ -54,6 +33,7 @@ class Mitigation:
     end_tick: Optional[int] = None
     wall_start_ms: int = 0
     wall_end_ms: int = 0
+    end_reason: Optional[str] = None
     _status: str = "pending"
 
     @property
@@ -71,7 +51,6 @@ class Mitigation:
         self.sim_end_ts = sim_ts + timedelta(minutes=self.duration_min)
 
     def apply(self, tick_state: TickState) -> TickState:
-        """Multiply volume_multiplier by factor for affected services."""
         if self._status != "active":
             return tick_state
 
@@ -83,16 +62,20 @@ class Mitigation:
 
         for svc in target_services:
             if svc in tick_state.services:
-                sd = tick_state.services[svc]
-                sd.volume_multiplier *= self.factor
+                tick_state.services[svc].volume_multiplier *= self.factor
 
         return tick_state
 
     def try_end(self, tick_index: int, sim_ts: datetime) -> bool:
-        if self._status == "active" and self.end_tick is not None and tick_index >= self.end_tick:
+        if (
+            self._status == "active"
+            and self.end_tick is not None
+            and tick_index >= self.end_tick
+        ):
             self._status = "ended"
             self.sim_end_ts = sim_ts
             self.wall_end_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            self.end_reason = "expired"
             return True
         return False
 
@@ -101,6 +84,7 @@ class Mitigation:
             self._status = "ended"
             self.sim_end_ts = sim_ts
             self.wall_end_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            self.end_reason = "ended_early"
             return True
         return False
 
@@ -118,6 +102,7 @@ class Mitigation:
             "sim_end_ts": self.sim_end_ts.isoformat() if self.sim_end_ts else None,
             "wall_start_ms": self.wall_start_ms,
             "wall_end_ms": self.wall_end_ms,
+            "end_reason": self.end_reason,
         }
 
 
@@ -141,35 +126,42 @@ class MitigationRegistry:
 
     def end_early(self, mitigation_id: str, sim_ts: datetime) -> bool:
         with self._lock:
-            m = self._mitigations.get(mitigation_id)
-            if not m or m.status == "ended":
+            mitigation = self._mitigations.get(mitigation_id)
+            if not mitigation or mitigation.status == "ended":
                 return False
-            ended = m.end_early(sim_ts)
+            ended = mitigation.end_early(sim_ts)
+
         if ended:
-            self._fire_end(m)
+            self._fire_end(mitigation)
+
         return ended
 
     def apply_all(self, tick_state: TickState) -> TickState:
         with self._lock:
-            mits = list(self._mitigations.values())
+            mitigations = list(self._mitigations.values())
 
         newly_activated: List[Mitigation] = []
         newly_ended: List[Mitigation] = []
 
-        for m in mits:
-            if m.status == "pending":
-                m.activate(tick_state.tick_index, tick_state.sim_ts)
-                newly_activated.append(m)
+        for mitigation in mitigations:
+            if mitigation.status == "pending":
+                mitigation.activate(tick_state.tick_index, tick_state.sim_ts)
+                newly_activated.append(mitigation)
 
-            if m.status == "active":
-                tick_state = m.apply(tick_state)
-                if m.try_end(tick_state.tick_index + 1, tick_state.sim_ts):
-                    newly_ended.append(m)
+            if mitigation.status == "active":
+                tick_state = mitigation.apply(tick_state)
 
-        for m in newly_activated:
-            self._fire_start(m)
-        for m in newly_ended:
-            self._fire_end(m)
+                if mitigation.try_end(
+                    tick_state.tick_index + 1,
+                    tick_state.sim_ts,
+                ):
+                    newly_ended.append(mitigation)
+
+        for mitigation in newly_activated:
+            self._fire_start(mitigation)
+
+        for mitigation in newly_ended:
+            self._fire_end(mitigation)
 
         return tick_state
 
@@ -179,7 +171,11 @@ class MitigationRegistry:
 
     def active_ids(self) -> List[str]:
         with self._lock:
-            return [m.mitigation_id for m in self._mitigations.values() if m.status == "active"]
+            return [
+                m.mitigation_id
+                for m in self._mitigations.values()
+                if m.status == "active"
+            ]
 
     def clear_all(self) -> None:
         with self._lock:
@@ -191,17 +187,16 @@ class MitigationRegistry:
     def on_end(self, cb: Callable[[Mitigation], None]) -> None:
         self._on_end_callbacks.append(cb)
 
-    def _fire_start(self, m: Mitigation) -> None:
-        for cb in self._on_start_callbacks:
+    def _fire_start(self, mitigation: Mitigation) -> None:
+        for callback in self._on_start_callbacks:
             try:
-                cb(m)
+                callback(mitigation)
             except Exception:
                 pass
 
-    def _fire_end(self, m: Mitigation) -> None:
-        for cb in self._on_end_callbacks:
+    def _fire_end(self, mitigation: Mitigation) -> None:
+        for callback in self._on_end_callbacks:
             try:
-                cb(m)
+                callback(mitigation)
             except Exception:
                 pass
-
