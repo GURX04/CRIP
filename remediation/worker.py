@@ -177,7 +177,7 @@ class RemediationWorker:
                 )
                 return None
 
-            if proposal.status == ProposalStatus.APPLIED:
+            if proposal.status in (ProposalStatus.APPLIED, ProposalStatus.DRY_RUN_RECORDED):
                 self._handle_rollback(proposal, sim_ts)
 
             elif proposal.status == ProposalStatus.PENDING_APPROVAL:

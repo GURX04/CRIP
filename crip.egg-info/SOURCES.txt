@@ -8,3 +8,9 @@ crip.egg-info/dependency_links.txt
 crip.egg-info/entry_points.txt
 crip.egg-info/requires.txt
 crip.egg-info/top_level.txt
+tests/test_dashboard.py
+tests/test_evaluation.py
+tests/test_generator.py
+tests/test_generator_mitigate.py
+tests/test_pipeline.py
+tests/test_remediation.py

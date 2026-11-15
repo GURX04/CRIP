@@ -1,222 +1,233 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CRIP — Live FinOps Demo</title>
-  <link rel="stylesheet" href="/static/vendor/uplot.min.css"/>
-  <link rel="stylesheet" href="/static/style.css"/>
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-
-<!-- ───────────── Banners ───────────── -->
-<div id="disconnected-banner">⚠ DISCONNECTED — Reconnecting…</div>
-<div id="replay-banner">⏺ REPLAY</div>
-
-<!-- ───────────── Toast container ───────────── -->
-<div id="toast-container"></div>
-
-<!-- ───────────── Top Bar ───────────── -->
-<header id="topbar">
-  <span class="logo">CRIP</span>
-
-  <span id="chip-redis" class="chip warn">Redis</span>
-  <span id="chip-gen"   class="chip warn">Generator</span>
-  <span id="chip-det"   class="chip warn">Detector</span>
-
-  <span id="sim-time">Sim: —</span>
-  <span id="run-id-label">Run: —</span>
-
-  <select id="speed-select" class="ctrl-select" title="Simulation speed">
-    <option value="1">1×</option>
-    <option value="5" selected>5×</option>
-    <option value="10">10×</option>
-    <option value="20">20×</option>
-    <option value="60">60×</option>
-  </select>
-
-  <button id="btn-pause" class="ctrl-btn">⏸ Pause</button>
-  <button id="btn-reset" class="ctrl-btn danger" title="Reset generator run">↺ Reset</button>
-
-  <!-- Remediation Controls -->
-  <button id="btn-remed-mode" class="ctrl-btn" title="Toggle Remediation Mode">Mode: DRY-RUN</button>
-  <button id="btn-kill-switch" class="ctrl-btn" title="Emergency Kill Switch">Kill Switch: OFF</button>
-  <span id="savings-counter" class="savings-chip">💰 Savings: $0.00</span>
-
-  <span style="font-size:0.75em;color:var(--text-muted);margin-left:auto">Press F = Presentation mode</span>
-</header>
-
-<!-- ───────────── Main Layout ───────────── -->
-<div id="main-layout">
-
-  <!-- ══════ LEFT COLUMN ══════ -->
-  <div id="left-col">
-
-    <!-- INJECT PANEL -->
-    <div class="panel inject-panel">
-      <div class="panel-title">💉 Inject Anomaly</div>
-
-      <div class="preset-row">
-        <button class="preset-btn">★</button>
-        <button class="preset-btn">★</button>
-        <button class="preset-btn">★</button>
-        <button class="preset-btn">★</button>
+  <div class="app">
+    <!-- SIDEBAR -->
+    <aside class="side">
+      <div class="brand">CR<i>I</i>P</div>
+      <a class="nav on" href="#overview"><b></b>Overview</a>
+      <a class="nav" href="#monitoring"><b></b>Monitoring</a>
+      <a class="nav" href="#intelligence"><b></b>Intelligence</a>
+      <a class="nav" href="#remediation"><b></b>Remediation</a>
+      <a class="nav" href="#history"><b></b>History</a>
+      <span class="sp"></span>
+      <div class="hl">
+        <div><span class="dot" id="d-redis"></span>Redis</div>
+        <div><span class="dot" id="d-gen"></span>Generator</div>
+        <div><span class="dot" id="d-det"></span>Detector</div>
+        <div id="run" style="margin-top:6px"></div>
       </div>
+    </aside>
 
-      <div class="form-row">
-        <label>Type</label>
-        <select id="inj-type">
-          <option value="spike">spike</option>
-          <option value="cost_only">cost_only</option>
-          <option value="slow_drift">slow_drift</option>
-          <option value="step_change">step_change</option>
-          <option value="seasonality_break">seasonality_break</option>
-        </select>
-      </div>
-      <div class="form-row">
-        <label>Service</label>
-        <select id="inj-svc">
-          <option value="DynamoDB">DynamoDB</option>
-          <option value="AmazonApiGateway">ApiGateway</option>
-          <option value="EC2 Data Transfer">EC2</option>
-          <option value="CloudWatch Logs">CloudWatch</option>
-          <option value="S3 PUT">S3</option>
-          <option value="all">all</option>
-        </select>
-      </div>
-      <div class="form-row">
-        <label>Magnitude</label>
-        <input type="range" id="mag-slider" min="1.1" max="10" step="0.1" value="4"/>
-        <span class="val" id="mag-slider-val">4x</span>
-      </div>
-      <div class="form-row">
-        <label>Duration</label>
-        <input type="range" id="dur-slider" min="5" max="120" step="5" value="30"/>
-        <span class="val" id="dur-slider-val">30m</span>
-      </div>
-      <div class="form-row">
-        <label>Ramp</label>
-        <input type="range" id="ramp-slider" min="0" max="20" step="1" value="0"/>
-        <span class="val" id="ramp-slider-val">0m</span>
-      </div>
-      <button id="inject-btn" class="inject-btn">💉 INJECT</button>
-      <div class="panel-title" style="margin-top:12px">Active Injections</div>
-      <div id="active-injections"><div style="font-size:0.8em;color:var(--text-muted)">No active injections</div></div>
-    </div>
+    <!-- MAIN CONTENT -->
+    <div class="main">
+      <div class="banner" id="banner">Disconnected. Reconnecting…</div>
 
-    <!-- STOPWATCH PANEL -->
-    <div class="panel" id="stopwatch-panel">
-      <div class="panel-title">⏱ Detection Latency</div>
-      <div class="sw-time" id="sw-time">—</div>
-      <div class="sw-detail" id="sw-detail">Click Inject to start</div>
-      <div class="sw-detector" id="sw-detector"></div>
-    </div>
+      <!-- TOP BAR -->
+      <header class="top">
+        <h1 id="title">Overview</h1>
+        <span class="sp"></span>
+        <div class="grp">
+          <span id="clock" class="muted">Sim —</span>
+          <select id="speed" aria-label="Speed">
+            <option value="1">1×</option>
+            <option value="5">5×</option>
+            <option value="10" selected>10×</option>
+            <option value="20">20×</option>
+          </select>
+          <button class="btn" data-act="pause" id="pause">Pause</button>
+          <button class="btn" data-act="reset">Reset</button>
+        </div>
+        <div class="grp">
+          <button class="btn on" data-act="mode" data-v="DRY_RUN" id="m-dry">Dry run</button>
+          <button class="btn" data-act="mode" data-v="ENFORCE" id="m-enf">Enforce</button>
+          <button class="btn" data-act="kill" id="kill">Kill switch: off</button>
+        </div>
+        <div class="grp">
+          <button class="btn" data-act="theme" id="theme">Dark</button>
+        </div>
+      </header>
 
-    <!-- EVAL TABLE -->
-    <div class="panel eval-table-wrap">
-      <div class="panel-title">📊 Evaluation</div>
-      <div class="eval-summary" id="eval-summary">
-        <div class="eval-metric">P <span>—</span></div>
-        <div class="eval-metric">R <span>—</span></div>
-        <div class="eval-metric">F1 <span>—</span></div>
-        <div class="eval-metric">FA/day <span>—</span></div>
-      </div>
-      <table class="eval-table">
-        <thead>
-          <tr>
-            <th>ID</th><th>Type</th><th>Svc</th><th>Lat</th><th>Detector</th><th>✓</th>
-          </tr>
-        </thead>
-        <tbody id="eval-tbody">
-          <tr><td colspan="6" style="color:var(--text-muted);font-size:0.8em">No injections yet</td></tr>
-        </tbody>
-      </table>
-    </div>
+      <!-- PAGE: OVERVIEW -->
+      <section class="page on" id="p-overview">
+        <div class="kpis">
+          <div class="card kpi">
+            <span>Cost this tick</span>
+            <b id="k-cost">—</b>
+            <small>all services</small>
+          </div>
+          <div class="card kpi">
+            <span>Open incidents</span>
+            <b id="k-open" style="color:var(--crit)">0</b>
+            <small id="k-open2">none</small>
+          </div>
+          <div class="card kpi">
+            <span>Last detection</span>
+            <b id="k-lat" style="color:var(--ok)">—</b>
+            <small id="k-by">inject an anomaly to measure</small>
+          </div>
+          <div class="card kpi">
+            <span>Potential savings</span>
+            <b id="k-sav">$0.00/hr</b>
+            <small>if proposals are approved</small>
+          </div>
+        </div>
 
-  </div><!-- /left-col -->
+        <div class="split">
+          <div class="card">
+            <div class="ch">
+              <h2 class="h">Cost over time</h2>
+              <span class="sp"></span>
+              <span data-range></span>
+              <label class="muted"><input type="checkbox" id="gt"> Show injected window</label>
+            </div>
+            <div id="c-cost"></div>
+            <div class="leg">
+              <span><i style="background:var(--c1)"></i>Actual</span>
+              <span><i style="background:var(--mut)"></i>Expected</span>
+              <span><i style="background:var(--crit)"></i>Anomaly</span>
+            </div>
+          </div>
 
-  <!-- ══════ RIGHT COLUMN ══════ -->
-  <div id="right-col">
+          <div class="card">
+            <h2 class="h">Inject anomaly</h2>
+            <div class="row" style="margin-top:12px">
+              <button class="btn pri" data-act="preset" data-i="0">DDB spike ×4</button>
+              <button class="btn" data-act="preset" data-i="1">Price hike</button>
+              <button class="btn" data-act="preset" data-i="2">Slow leak</button>
+              <button class="btn" data-act="preset" data-i="3">All ×2</button>
+            </div>
+            <label class="f">Type
+              <select id="i-type">
+                <option value="spike">spike</option>
+                <option value="step_change">step_change</option>
+                <option value="slow_drift">slow_drift</option>
+                <option value="cost_only" selected>cost_only</option>
+                <option value="seasonality_break">seasonality_break</option>
+              </select>
+            </label>
+            <label class="f">Service
+              <select id="i-svc"></select>
+            </label>
+            <label class="f">Magnitude <b id="v-mag">5.0×</b>
+              <input type="range" id="i-mag" min="1.2" max="10" step="0.1" value="5">
+            </label>
+            <label class="f">Duration <b id="v-dur">20 min</b>
+              <input type="range" id="i-dur" min="5" max="120" step="5" value="20">
+            </label>
+            <label class="f">Ramp <b id="v-ramp">0 min</b>
+              <input type="range" id="i-ramp" min="0" max="30" step="5" value="0">
+            </label>
+            <button class="btn pri" style="width:100%;margin-top:12px" data-act="inject">Inject</button>
+            <div id="active" style="margin-top:10px" class="muted"></div>
+          </div>
+        </div>
 
-    <!-- MAIN COST CHART -->
-    <div class="chart-wrap" id="main-chart-wrap">
-      <div class="chart-title">Total Cost (all services)
-        <label class="chart-toggle" title="Show/hide ground-truth injection regions">
-          <input type="checkbox" id="gt-toggle" checked/> Ground truth
-        </label>
-      </div>
-      <!-- uPlot renders into this div -->
-    </div>
+        <div class="two">
+          <div class="card">
+            <div class="ch"><h2 class="h">Open incidents</h2></div>
+            <div id="o-inc"></div>
+          </div>
+          <div class="card">
+            <h2 class="h" style="margin-bottom:12px">Detector quality</h2>
+            <div class="row">
+              <div class="stat"><span class="muted">Precision</span><b id="q-p">—</b></div>
+              <div class="stat"><span class="muted">Recall</span><b id="q-r">—</b></div>
+            </div>
+            <div class="row" style="margin-top:8px">
+              <div class="stat"><span class="muted">F1</span><b id="q-f">—</b></div>
+              <div class="stat"><span class="muted">False alarms/day</span><b id="q-a">—</b></div>
+            </div>
+          </div>
+        </div>
+      </section>
 
-    <!-- PER-SERVICE SMALL CHARTS -->
-    <div class="small-charts">
-      <div class="chart-wrap" id="chart-0"><div class="chart-title">API GW</div></div>
-      <div class="chart-wrap" id="chart-1"><div class="chart-title">EC2</div></div>
-      <div class="chart-wrap" id="chart-2"><div class="chart-title">DDB</div></div>
-      <div class="chart-wrap" id="chart-3"><div class="chart-title">CWL</div></div>
-      <div class="chart-wrap" id="chart-4"><div class="chart-title">S3</div></div>
-    </div>
+      <!-- PAGE: MONITORING -->
+      <section class="page" id="p-monitoring">
+        <div class="split">
+          <div class="card">
+            <div class="ch">
+              <h2 class="h">Cost by service</h2>
+              <span class="sp"></span>
+              <span data-range></span>
+            </div>
+            <div id="c-stack"></div>
+            <div class="leg" id="leg"></div>
+          </div>
+          <div class="card">
+            <h2 class="h" style="margin-bottom:12px">Services now</h2>
+            <div class="tiles" id="tiles"></div>
+          </div>
+        </div>
+      </section>
 
-    <!-- ALERT FEED + RCA PANEL -->
-    <div class="panel">
-      <div class="panel-title">🚨 Alert Feed</div>
-      <div id="alert-feed"></div>
-    </div>
+      <!-- PAGE: INTELLIGENCE -->
+      <section class="page" id="p-intelligence">
+        <div class="card">
+          <div class="ch">
+            <h2 class="h">Anomaly timeline</h2>
+            <span class="sp"></span>
+            <span data-range></span>
+          </div>
+          <div id="c-tl"></div>
+        </div>
+        <div class="two">
+          <div class="card">
+            <h2 class="h" style="margin-bottom:12px">Incident detail</h2>
+            <div id="i-det"></div>
+          </div>
+          <div class="card">
+            <h2 class="h" style="margin-bottom:12px">Why it fired</h2>
+            <div id="i-why"></div>
+          </div>
+        </div>
+      </section>
 
-    <div id="rca-panel">
-      <div class="rca-title">Root Cause Analysis — <span id="rca-type-label">—</span></div>
-      <div class="rca-classification" id="rca-classification">Click an alert to see RCA.</div>
-      <div id="rca-bars"></div>
-      <div class="rca-metric-row">
-        <div class="rca-metric"><div class="label">Cost/1k req (now)</div><div class="value" id="rca-cost-now">—</div></div>
-        <div class="rca-metric"><div class="label">Cost/1k req (baseline)</div><div class="value" id="rca-cost-base">—</div></div>
-        <div class="rca-metric"><div class="label">Cost Δ</div><div class="value" id="rca-pct-cost">—</div></div>
-        <div class="rca-metric"><div class="label">Volume Δ</div><div class="value" id="rca-pct-volume">—</div></div>
-      </div>
-      <div class="rca-remediation" id="rca-remediation-action">Proposed Action: —</div>
-    </div>
+      <!-- PAGE: REMEDIATION -->
+      <section class="page" id="p-remediation">
+        <div class="kpis">
+          <div class="card kpi"><span>Mode</span><b id="r-mode">—</b><small>no real actions in dry run</small></div>
+          <div class="card kpi"><span>Pending approval</span><b id="r-pend">0</b><small>needs a decision</small></div>
+          <div class="card kpi"><span>Applied</span><b id="r-app">0</b><small>this run</small></div>
+          <div class="card kpi"><span>Savings recorded</span><b id="r-sav">$0.00</b><small>from remediation results</small></div>
+        </div>
+        <div class="card">
+          <div class="ch">
+            <h2 class="h">Proposals</h2>
+            <span class="sp"></span>
+            <span id="r-f"></span>
+          </div>
+          <div id="r-tab"></div>
+        </div>
+      </section>
 
-    <!-- REMEDIATION PANEL -->
-    <div class="panel" id="remediation-panel">
-      <div class="panel-title" style="display:flex;justify-content:space-between;align-items:center;">
-        <span>🛡 Automated Remediation & Mitigations</span>
-        <span id="remed-status-summary" style="font-size:0.8em;color:var(--text-muted);">0 active</span>
-      </div>
-      <table class="remediation-table">
-        <thead>
-          <tr>
-            <th>Time</th><th>Service</th><th>Action</th><th>Est. Savings</th><th>Risk</th><th>Status</th><th>Controls</th>
-          </tr>
-        </thead>
-        <tbody id="remediation-tbody">
-          <tr><td colspan="7" style="color:var(--text-muted);font-size:0.85em;">No remediation proposals yet</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-  </div><!-- /right-col -->
-
-</div><!-- /main-layout -->
-
-<!-- Confirmation Modal for ENFORCE mode -->
-<div id="enforce-modal" class="modal-overlay">
-  <div class="modal-box">
-    <div class="modal-title">⚠ Enable ENFORCE Mode?</div>
-    <div class="modal-body">
-      In ENFORCE mode, approved remediation actions (such as rate-limiting and throttling) will actively call the live event generator to throttle requests and reduce traffic volume.
-      <br/><br/>
-      Are you sure you want to switch from DRY-RUN to ENFORCE?
-    </div>
-    <div class="modal-actions">
-      <button id="modal-cancel-btn" class="ctrl-btn">Cancel</button>
-      <button id="modal-confirm-btn" class="ctrl-btn danger">Yes, Enable ENFORCE</button>
+      <!-- PAGE: HISTORY -->
+      <section class="page" id="p-history">
+        <div class="card">
+          <div class="ch"><h2 class="h">Filters</h2></div>
+          <div class="row">
+            <span id="h-s"></span>
+            <span id="h-v"></span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="ch">
+            <h2 class="h">Incident lifecycle</h2>
+            <span class="muted" style="font-size:12px">Detected → Proposed → Mitigated → Resolved</span>
+          </div>
+          <div id="h-tab"></div>
+        </div>
+      </section>
     </div>
   </div>
-</div>
 
-<!-- ───────────── Scripts ───────────── -->
-<script src="/static/vendor/uplot.min.js"></script>
-<script src="/static/app.js"></script>
+  <div id="toast"></div>
+  <script src="/static/app.js"></script>
 </body>
 </html>
-

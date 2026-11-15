@@ -1,1038 +1,755 @@
-/**
- * CRIP Live Dashboard — app.js
- *
- * Vanilla ES2020 — no build step, no framework.
- * Depends only on uPlot (vendored) loaded before this script.
- *
- * Architecture:
- *   SSEClient → EventBus → Components (TopBar, Charts, InjectPanel, Stopwatch, Alerts, RCA, Eval)
- */
 'use strict';
 
-// ============================================================
-// Constants
-// ============================================================
-const SERVICES = ['AmazonApiGateway', 'EC2 Data Transfer', 'DynamoDB', 'CloudWatch Logs', 'S3 PUT'];
-const SVC_SHORT = { 'AmazonApiGateway': 'API GW', 'EC2 Data Transfer': 'EC2', 'DynamoDB': 'DDB', 'CloudWatch Logs': 'CWL', 'S3 PUT': 'S3' };
-const SVC_COLOR = { 'AmazonApiGateway': '#0072B2', 'EC2 Data Transfer': '#E69F00', 'DynamoDB': '#009E73', 'CloudWatch Logs': '#CC79A7', 'S3 PUT': '#56B4E9' };
-const MAX_POINTS = 720;   // per series in main chart
-const CHART_HEIGHT_MAIN = 180;
-const CHART_HEIGHT_SMALL = 100;
-
-// ============================================================
-// Utility helpers
-// ============================================================
-const $  = (sel) => document.querySelector(sel);
-const $$ = (sel) => [...document.querySelectorAll(sel)];
-const fmt2 = (n) => typeof n === 'number' ? n.toFixed(2) : '—';
-const fmtMs = (ms) => ms < 1000 ? ms + 'ms' : (ms/1000).toFixed(1) + 's';
-const fmtSimTs = (iso) => iso ? iso.slice(11, 16) : '—';
-const isoToEpoch = (iso) => iso ? new Date(iso).getTime() / 1000 : 0;
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-
-function showToast(msg, type = 'info', durationMs = 4000) {
-  const wrap = $('#toast-container');
-  const div = document.createElement('div');
-  div.className = `toast ${type}`;
-  div.textContent = msg;
-  wrap.appendChild(div);
-  setTimeout(() => div.remove(), durationMs);
-}
-
-// ============================================================
-// EventBus (simple pub/sub)
-// ============================================================
-class EventBus {
-  constructor() { this._h = {}; }
-  on(ev, fn) { (this._h[ev] = this._h[ev] || []).push(fn); }
-  emit(ev, data) { (this._h[ev] || []).forEach(fn => fn(data)); }
-}
-const bus = new EventBus();
-
-// ============================================================
-// SSE Client (auto-reconnect with backoff)
-// ============================================================
-class SSEClient {
-  constructor(url) {
-    this._url = url;
-    this._backoff = 1000;
-    this._es = null;
-    this._connect();
-  }
-  _connect() {
-    if (this._es) this._es.close();
-    this._es = new EventSource(this._url);
-    this._es.onopen = () => {
-      this._backoff = 1000;
-      $('#disconnected-banner').classList.remove('visible');
-      bus.emit('connected', {});
-    };
-    this._es.onerror = () => {
-      $('#disconnected-banner').classList.add('visible');
-      this._es.close();
-      setTimeout(() => this._connect(), this._backoff);
-      this._backoff = Math.min(this._backoff * 2, 30000);
-    };
-    ['tick','detection','injection','eval','state','heartbeat','remediation_proposal','mitigation','remediation_result'].forEach(ev => {
-      this._es.addEventListener(ev, e => {
-        try { bus.emit(ev, JSON.parse(e.data)); }
-        catch(err) { console.warn('SSE parse error', err); }
-      });
-    });
-  }
-}
-
-// ============================================================
-// Data store (rolling window per service)
-// ============================================================
-class DataStore {
-  constructor() {
-    this.reset();
-  }
-  reset() {
-    this.runId = null;
-    // per service: arrays of [epoch_s, cost, expected_cost]
-    this.ticks = {};
-    this.detections = [];
-    this.injections = {};
-    SERVICES.forEach(s => { this.ticks[s] = { ts: [], cost: [], exp: [] }; });
-  }
-  addTick(d) {
-    const svc = d.service;
-    if (!this.ticks[svc]) return;
-    const t = this.ticks[svc];
-    const ep = isoToEpoch(d.sim_ts);
-    t.ts.push(ep);
-    t.cost.push(d.cost ?? d.unblended_cost ?? 0);
-    t.exp.push(d.expected_cost ?? 0);
-    if (t.ts.length > MAX_POINTS) {
-      t.ts.shift(); t.cost.shift(); t.exp.shift();
-    }
-  }
-  addDetection(d) {
-    this.detections.push(d);
-    if (this.detections.length > 200) this.detections.shift();
-  }
-  addInjection(d) {
-    this.injections[d.injection_id] = d;
-  }
-  totalCostSeries() {
-    let refSvc = SERVICES[0];
-    for (const s of SERVICES) {
-      if ((this.ticks[s]?.ts?.length || 0) > (this.ticks[refSvc]?.ts?.length || 0)) refSvc = s;
-    }
-    const ref = this.ticks[refSvc];
-    if (!ref || !ref.ts || ref.ts.length === 0) return { ts: [], cost: [], exp: [] };
-    const n = ref.ts.length;
-    const costs = new Float64Array(n);
-    const exps  = new Float64Array(n);
-    for (const s of SERVICES) {
-      const t = this.ticks[s];
-      if (!t || !t.ts) continue;
-      const off = n - t.ts.length;
-      for (let i = 0; i < t.ts.length; i++) {
-        costs[off + i] += t.cost[i] || 0;
-        exps[off + i]  += t.exp[i]  || 0;
-      }
-    }
-    return {
-      ts:   ref.ts,
-      cost: Array.from(costs),
-      exp:  Array.from(exps),
-    };
-  }
-}
-const store = new DataStore();
-
-// ============================================================
-// TopBar component
-// ============================================================
-class TopBar {
-  constructor() {
-    this._simTs = '—';
-    this._runId = '—';
-    this._paused = false;
-    this._speed  = 5;
-    this._bindControls();
-    this._startHealthPolling();
-  }
-  _bindControls() {
-    $('#btn-pause').addEventListener('click', async () => {
-      const ep = this._paused ? '/api/control/resume' : '/api/control/pause';
-      await apiFetch('POST', ep, {});
-      this._paused = !this._paused;
-      $('#btn-pause').textContent = this._paused ? '▶ Resume' : '⏸ Pause';
-    });
-    $('#speed-select').addEventListener('change', async (e) => {
-      const v = parseFloat(e.target.value);
-      await apiFetch('POST', '/api/control/speed', { sim_minutes_per_real_second: v });
-      this._speed = v;
-      showToast(`Speed set to ${v}x`, 'info');
-    });
-    $('#btn-reset').addEventListener('click', async () => {
-      if (!confirm('Reset generator? This clears all state and starts a new run.')) return;
-      const res = await apiFetch('POST', '/api/control/reset', {});
-      if (res) showToast(`New run: ${res.run_id}`, 'success');
-    });
-    // Presentation mode
-    document.addEventListener('keydown', e => {
-      if (e.key === 'f' || e.key === 'F') {
-        document.body.classList.toggle('present');
-        showToast(document.body.classList.contains('present') ? 'Presentation mode ON' : 'Presentation mode OFF', 'info', 2000);
-      }
-    });
-  }
-  update(d) {
-    if (d.sim_ts)  { this._simTs = d.sim_ts; $('#sim-time').textContent = 'Sim: ' + fmtSimTs(d.sim_ts); }
-    if (d.run_id)  { this._runId = d.run_id; $('#run-id-label').textContent = 'Run: ' + d.run_id.slice(0,8); }
-    if (typeof d.paused !== 'undefined') {
-      this._paused = d.paused;
-      $('#btn-pause').textContent = d.paused ? '▶ Resume' : '⏸ Pause';
-    }
-    if (d.sim_minutes_per_real_second) {
-      this._speed = d.sim_minutes_per_real_second;
-      $('#speed-select').value = d.sim_minutes_per_real_second;
-    }
-  }
-  setChipStatus(id, ok) {
-    const el = $('#chip-' + id);
-    if (!el) return;
-    el.className = 'chip ' + (ok ? 'ok' : 'err');
-  }
-  async _startHealthPolling() {
-    const poll = async () => {
-      try {
-        const h = await apiFetch('GET', '/health', null);
-        if (h) {
-          this.setChipStatus('gen', h.generator?.ok);
-          this.setChipStatus('det', h.detector?.ok);
-          this.setChipStatus('redis', h.redis?.ok);
-        }
-      } catch(e) {}
-      setTimeout(poll, 5000);
-    };
-    setTimeout(poll, 1000);
-  }
-}
-
-// ============================================================
-// Chart manager (uPlot)
-// ============================================================
-class ChartManager {
-  constructor() {
-    this._mainPlot = null;
-    this._svcPlots = {};
-    this._showGT   = true;    // show ground-truth injection regions
-    this._markers  = [];      // recent anomaly markers (drawn on canvas)
-    this._regions  = [];      // ground-truth injection regions (drawn on canvas)
-
-    // Rendering throttle state
-    this._dirtyServices = new Set();
-    this._dirtyTotal = false;
-    this._renderPending = false;
-
-    this._initMain();
-    this._initSmall();
-
-    bus.on('tick', d => this._onTick(d));
-    bus.on('detection', d => this._onDetection(d));
-    bus.on('injection', d => this._onInjection(d));
-    bus.on('mitigation', m => this._onMitigation(m));
-
-    $('#gt-toggle').addEventListener('change', e => {
-      this._showGT = e.target.checked;
-      if (this._mainPlot) {
-        this._mainPlot.setRegions(this._showGT ? this._regions : []);
-      }
-    });
-
-    let resizeTimer = null;
-    window.addEventListener('resize', () => {
-      clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => this._redrawAll(), 150);
-    });
-  }
-
-  _uplotOpts(title, seriesLabels, colors, height, container) {
-    return {
-      title,
-      width:  container.clientWidth || 600,
-      height: height,
-      cursor: { show: true },
-      legend: { show: seriesLabels.length > 1 },
-      axes: [
-        { stroke: '#8b949e', grid: { stroke: '#21262d' },
-          values: (u, vs) => vs.map(v => v ? new Date(v*1000).toISOString().slice(11,16) : '') },
-        { stroke: '#8b949e', grid: { stroke: '#21262d' },
-          values: (u, vs) => vs.map(v => v != null ? '$' + v.toFixed(4) : '') },
-      ],
-      series: [
-        {},  // x (time)
-        ...seriesLabels.map((label, i) => ({
-          label, stroke: colors[i], width: 2, fill: i === 1 ? 'rgba(88,166,255,0.1)' : undefined,
-        })),
-      ],
-    };
-  }
-
-  _initMain() {
-    const wrap = $('#main-chart-wrap');
-    if (!wrap || typeof uPlot === 'undefined') return;
-    const opts = this._uplotOpts('Total Cost', ['Actual', 'Expected'], ['#F0E442', '#58a6ff'], CHART_HEIGHT_MAIN, wrap);
-    this._mainPlot = new uPlot(opts, [[], [], []], wrap);
-  }
-
-  _initSmall() {
-    SERVICES.forEach((svc, i) => {
-      const wrap = $('#chart-' + i);
-      if (!wrap || typeof uPlot === 'undefined') return;
-      const color = SVC_COLOR[svc] || '#58a6ff';
-      const opts = this._uplotOpts(SVC_SHORT[svc], ['Actual', 'Expected'], [color, '#58a6ff'], CHART_HEIGHT_SMALL, wrap);
-      this._svcPlots[svc] = new uPlot(opts, [[], [], []], wrap);
-    });
-  }
-
-  _onTick(d) {
-    store.addTick(d);
-    this._dirtyServices.add(d.service);
-    this._dirtyTotal = true;
-    this._scheduleRender();
-  }
-
-  _onDetection(d) {
-    store.addDetection(d);
-    const ep = isoToEpoch(d.sim_ts);
-    const sev = d.severity || 50;
-    const color = sev > 70 ? '#FF5252' : sev > 40 ? '#FFB300' : '#8b949e';
-    this._markers.push({ ts: ep, color });
-    if (this._markers.length > 80) this._markers.shift();
-
-    this._dirtyTotal = true;
-    this._scheduleRender();
-  }
-
-  _onInjection(d) {
-    store.addInjection(d);
-    const start = isoToEpoch(d.sim_start_ts);
-    const end = d.sim_end_ts ? isoToEpoch(d.sim_end_ts) : null;
-    const color = SVC_COLOR[d.service] || '#CC79A7';
-    this._regions.push({ start, end, color });
-    if (this._regions.length > 30) this._regions.shift();
-
-    this._dirtyTotal = true;
-    this._scheduleRender();
-  }
-
-  _onMitigation(m) {
-    const start = isoToEpoch(m.sim_start_ts);
-    const end = m.sim_end_ts ? isoToEpoch(m.sim_end_ts) : null;
-    const color = 'rgba(0, 200, 83, 0.25)';
-    this._regions.push({ start, end, color });
-    if (this._regions.length > 50) this._regions.shift();
-    this._dirtyTotal = true;
-    this._scheduleRender();
-  }
-
-  _scheduleRender() {
-    if (this._renderPending) return;
-    this._renderPending = true;
-    requestAnimationFrame(() => {
-      this._renderPending = false;
-      this._flushRender();
-    });
-  }
-
-  _flushRender() {
-    // 1. Redraw only modified service small plots (at most once per frame)
-    for (const svc of this._dirtyServices) {
-      const p = this._svcPlots[svc];
-      if (p) {
-        const t = store.ticks[svc];
-        p.setData([t.ts, t.cost, t.exp]);
-      }
-    }
-    this._dirtyServices.clear();
-
-    // 2. Redraw main plot with updated series + canvas markers/regions (at most once per frame)
-    if (this._dirtyTotal && this._mainPlot) {
-      this._dirtyTotal = false;
-      const tot = store.totalCostSeries();
-      this._mainPlot.setData([tot.ts, tot.cost, tot.exp]);
-      this._mainPlot.setMarkers(this._markers);
-      if (this._showGT) {
-        this._mainPlot.setRegions(this._regions);
-      }
-    }
-  }
-
-  _redrawAll() {
-    if (this._mainPlot) {
-      const wrap = $('#main-chart-wrap');
-      if (wrap) this._mainPlot.setSize({ width: wrap.clientWidth, height: CHART_HEIGHT_MAIN });
-    }
-    SERVICES.forEach((svc, i) => {
-      const p = this._svcPlots[svc];
-      const wrap = $('#chart-' + i);
-      if (p && wrap) p.setSize({ width: wrap.clientWidth, height: CHART_HEIGHT_SMALL });
-    });
-  }
-
-  loadHistory(h) {
-    if (!h) return;
-    h.ticks.forEach(t => store.addTick(t));
-    h.detections.forEach(d => {
-      store.addDetection(d);
-      const ep = isoToEpoch(d.sim_ts);
-      const sev = d.severity || 50;
-      const color = sev > 70 ? '#FF5252' : sev > 40 ? '#FFB300' : '#8b949e';
-      this._markers.push({ ts: ep, color });
-    });
-    h.injections.forEach(inj => {
-      store.addInjection(inj);
-      const start = isoToEpoch(inj.sim_start_ts);
-      const end = inj.sim_end_ts ? isoToEpoch(inj.sim_end_ts) : null;
-      const color = SVC_COLOR[inj.service] || '#CC79A7';
-      this._regions.push({ start, end, color });
-    });
-    this._redrawAll();
-    this._flushRender();
-  }
-}
-
-// ============================================================
-// InjectPanel
-// ============================================================
-class InjectPanel {
-  constructor() {
-    this._activeInjections = {};
-    this._bindForm();
-    this._bindPresets();
-    this._pollActiveInjections();
-    bus.on('injection', d => { this._activeInjections[d.injection_id] = d; this._renderList(); });
-  }
-  _bindForm() {
-    ['mag-slider','dur-slider','ramp-slider'].forEach(id => {
-      const el = $('#' + id);
-      if (!el) return;
-      el.addEventListener('input', () => {
-        const out = $('#' + id + '-val');
-        if (out) out.textContent = el.value + (id==='mag-slider' ? 'x' : 'm');
-      });
-    });
-    $('#inject-btn').addEventListener('click', () => this._doInject());
-  }
-  _bindPresets() {
-    const presets = [
-      { label: '⚡ DDB Spike ×4', p: { type: 'spike', service: 'DynamoDB', magnitude: 4, duration_min: 30 } },
-      { label: '💰 Price Hike',   p: { type: 'cost_only', service: 'DynamoDB', magnitude: 5, duration_min: 20 } },
-      { label: '🌊 Slow Leak',    p: { type: 'slow_drift', service: 'AmazonApiGateway', magnitude: 30, duration_min: 60 } },
-      { label: '🔥 All ×2',       p: { type: 'spike', service: 'all', magnitude: 2, duration_min: 15 } },
-    ];
-    $$('.preset-btn').forEach((btn, i) => {
-      if (presets[i]) {
-        btn.textContent = presets[i].label;
-        btn.addEventListener('click', () => this._applyPreset(presets[i].p));
-      }
-    });
-  }
-  _applyPreset(p) {
-    if ($('#inj-type'))  $('#inj-type').value  = p.type;
-    if ($('#inj-svc'))   $('#inj-svc').value   = p.service;
-    if ($('#mag-slider')) { $('#mag-slider').value = p.magnitude; $('#mag-slider-val').textContent = p.magnitude + 'x'; }
-    if ($('#dur-slider')) { $('#dur-slider').value = p.duration_min; $('#dur-slider-val').textContent = p.duration_min + 'm'; }
-    this._doInject(p);
-  }
-  async _doInject(override) {
-    const body = override || {
-      type:        $('#inj-type')?.value  || 'spike',
-      service:     $('#inj-svc')?.value   || 'DynamoDB',
-      magnitude:   parseFloat($('#mag-slider')?.value || 2),
-      duration_min:parseFloat($('#dur-slider')?.value || 30),
-      ramp_min:    parseFloat($('#ramp-slider')?.value || 0),
-    };
-    const res = await apiFetch('POST', '/api/inject', body);
-    if (res?.injection_id) {
-      showToast(`Injected: ${body.type} on ${body.service}`, 'success');
-      bus.emit('inject_started', { ...body, ...res, wall_start_ms: Date.now() });
-    }
-  }
-  async _pollActiveInjections() {
-    const res = await apiFetch('GET', '/api/injections', null);
-    if (res) {
-      res.forEach(inj => { if (inj.status !== 'ended') this._activeInjections[inj.injection_id] = inj; });
-      this._renderList();
-    }
-    setTimeout(() => this._pollActiveInjections(), 5000);
-  }
-  _renderList() {
-    const list = $('#active-injections');
-    if (!list) return;
-    const active = Object.values(this._activeInjections).filter(i => i.status !== 'ended');
-    list.innerHTML = active.length === 0
-      ? '<div style="font-size:0.8em;color:var(--text-muted)">No active injections</div>'
-      : active.map(i => `
-          <div class="inj-item">
-            <span>${i.type} ${SVC_SHORT[i.service]||i.service} ×${i.magnitude}</span>
-            <button class="inj-end-btn" onclick="injectPanel.endInjection('${i.injection_id}')">End</button>
-          </div>`).join('');
-  }
-  async endInjection(id) {
-    await apiFetch('DELETE', '/api/inject/' + id, null);
-    if (this._activeInjections[id]) this._activeInjections[id].status = 'ended';
-    this._renderList();
-    showToast('Injection ended', 'info');
-  }
-}
-
-// ============================================================
-// Latency Stopwatch
-// ============================================================
-class StopwatchPanel {
-  constructor() {
-    this._timer  = null;
-    this._start  = null;
-    this._active = null;   // { injection_id, service, wall_start_ms }
-    this._history = [];
-    this._timeout = 60000; // 60 real seconds
-    bus.on('inject_started', d => this._onInjectStart(d));
-    bus.on('detection',      d => this._onDetection(d));
-  }
-  _startTimer() {
-    this._stopTimer();
-    this._timer = setInterval(() => this._tick(), 100);
-  }
-  _stopTimer() {
-    if (this._timer) {
-      clearInterval(this._timer);
-      this._timer = null;
-    }
-  }
-  _onInjectStart(d) {
-    this._active = d;
-    this._start  = d.wall_start_ms || Date.now();
-    this._setDisplay(0, 'running');
-    this._startTimer();
-    // Auto-miss after timeout
-    clearTimeout(this._missTimer);
-    this._missTimer = setTimeout(() => {
-      if (this._active && this._active.injection_id === d.injection_id) {
-        this._stopTimer();
-        this._setDisplay(null, 'missed');
-        this._history.push({ ...d, detected: false, latency_wall_s: null, first_detector: '—' });
-        this._active = null;
-        evalPanel.updateHistory(this._history);
-      }
-    }, this._timeout);
-  }
-  _onDetection(det) {
-    if (!this._active) return;
-    // Check service match (or "all")
-    if (det.service !== this._active.service && this._active.service !== 'all') return;
-    this._stopTimer();
-    const latency = (det.detect_wall_ts_ms - this._start) / 1000;
-    const simMin  = latency * (parseFloat($('#speed-select')?.value || 5)) / 60;
-    const firstDet = det.detector_votes?.find(v => v.is_anomaly)?.detector_name || '—';
-    this._setDisplay(latency, 'frozen', simMin, firstDet, det.rca);
-    clearTimeout(this._missTimer);
-    this._history.push({
-      ...this._active,
-      detected: true,
-      latency_wall_s: latency,
-      latency_sim_min: simMin,
-      first_detector: firstDet,
-    });
-    this._active = null;
-    evalPanel.updateHistory(this._history);
-  }
-  _tick() {
-    if (!this._active || !this._start) return;
-    const elapsed = (Date.now() - this._start) / 1000;
-    this._setDisplay(elapsed, 'running');
-  }
-  _setDisplay(seconds, state, simMin, detector, rca) {
-    const timeEl = $('#sw-time');
-    const detEl  = $('#sw-detector');
-    const detailEl = $('#sw-detail');
-    if (!timeEl) return;
-    if (state === 'running') {
-      timeEl.textContent = seconds !== null ? seconds.toFixed(1) + 's' : '—';
-      timeEl.className = 'sw-time';
-      if (detEl) detEl.textContent = '';
-      if (detailEl) detailEl.textContent = 'Waiting for detection…';
-    } else if (state === 'frozen') {
-      timeEl.textContent = seconds.toFixed(1) + 's';
-      timeEl.className = 'sw-time frozen';
-      if (detailEl) detailEl.textContent = `≈ ${(simMin||0).toFixed(0)} sim-min`;
-      if (detEl) detEl.textContent = 'by: ' + (detector || '—');
-      if (rca) rcaPanel.show(rca);
-    } else if (state === 'missed') {
-      timeEl.textContent = 'MISSED';
-      timeEl.className = 'sw-time missed';
-      if (detailEl) detailEl.textContent = 'No detection within 60s';
-      if (detEl) detEl.textContent = '';
-    }
-  }
-}
-
-// ============================================================
-// Alert Feed
-// ============================================================
-class AlertFeed {
-  constructor() {
-    this._detections = [];
-    this._renderPending = false;
-    bus.on('detection', d => this._add(d));
-  }
-  _add(d) {
-    this._detections.unshift(d);
-    if (this._detections.length > 50) this._detections.pop();
-    this._scheduleRender();
-  }
-  _scheduleRender() {
-    if (this._renderPending) return;
-    this._renderPending = true;
-    requestAnimationFrame(() => {
-      this._renderPending = false;
-      this._render();
-    });
-  }
-  _render() {
-    const feed = $('#alert-feed');
-    if (!feed) return;
-    if (this._detections.length === 0) {
-      feed.innerHTML = '<div style="font-size:0.8em;color:var(--text-muted);padding:8px 0">No alerts detected yet</div>';
-      return;
-    }
-    feed.innerHTML = this._detections.slice(0, 20).map((d, i) => {
-      const sev = d.severity || 0;
-      const cls = sev > 70 ? 'sev-high' : sev > 40 ? 'sev-medium' : 'sev-low';
-      const votes = (d.detector_votes || []).filter(v => v.is_anomaly).map(v => v.detector_name).join(', ');
-      return `<div class="alert-item" onclick="alertFeed.clickAlert(${i})">
-        <span class="sev-badge ${cls}">${sev.toFixed(0)}</span>
-        <div>
-          <div class="alert-svc">${d.service} <span class="alert-status-${d.status}">[${d.status}]</span></div>
-          <div class="alert-meta">${fmtSimTs(d.sim_ts)} · ${votes || 'unknown'}</div>
-        </div>
-      </div>`;
-    }).join('');
-  }
-  clickAlert(idx) {
-    const d = this._detections[idx];
-    if (d && d.rca) rcaPanel.show(d.rca);
-  }
-  loadHistory(detections) {
-    this._detections = [...detections].reverse();
-    this._scheduleRender();
-  }
-}
-
-// ============================================================
-// RCA Panel
-// ============================================================
-class RCAPanel {
-  show(rca) {
-    const panel = $('#rca-panel');
-    if (!panel || !rca) return;
-    panel.classList.add('visible');
-
-    const classifications = {
-      traffic_driven:        'Cost and volume both rose — this is real demand increase, not a configuration change.',
-      price_driven:          'Cost rose but request volume did not. Likely a pricing or configuration change — not real demand.',
-      volume_drop_cost_flat: 'Request volume fell but cost stayed flat — a potential zombie resource or billing anomaly.',
-      unknown:               'Could not classify the anomaly driver confidently.',
-    };
-    const cls = rca.alert_type || rca.classification || 'unknown';
-    $('#rca-classification').textContent = classifications[cls] || cls;
-    $('#rca-type-label').textContent = cls.replace(/_/g, ' ').toUpperCase();
-
-    // Service contribution bars
-    const contrib = rca.service_contributions || rca.service_contribution || {};
-    const bars = $('#rca-bars');
-    if (bars) {
-      bars.innerHTML = Object.entries(contrib).map(([svc, frac]) => `
-        <div class="rca-bar-row">
-          <span class="rca-bar-label">${SVC_SHORT[svc]||svc}</span>
-          <div class="rca-bar-track"><div class="rca-bar-fill" style="width:${(frac*100).toFixed(1)}%"></div></div>
-          <span class="rca-bar-val">${(frac*100).toFixed(1)}%</span>
-        </div>`).join('');
-    }
-
-    // Metrics
-    const now1k = rca.cost_per_1k_now || rca.cost_per_1k_requests_now || 0;
-    const base1k = rca.cost_per_1k_baseline || 0;
-    const pctCost = rca.pct_cost_change || 0;
-    const pctVol  = rca.pct_volume_change || 0;
-    if ($('#rca-cost-now'))    $('#rca-cost-now').textContent   = '$' + now1k.toFixed(4);
-    if ($('#rca-cost-base'))   $('#rca-cost-base').textContent  = '$' + base1k.toFixed(4);
-    if ($('#rca-pct-cost'))    $('#rca-pct-cost').textContent   = (pctCost >= 0 ? '+' : '') + pctCost.toFixed(1) + '%';
-    if ($('#rca-pct-volume'))  $('#rca-pct-volume').textContent = (pctVol >= 0 ? '+' : '') + pctVol.toFixed(1) + '%';
-
-    // Proposed action display in RCA Card
-    const actionEl = $('#rca-remediation-action');
-    if (actionEl) {
-      if (cls === 'price_driven') {
-        actionEl.textContent = 'Proposed Action: No throttle recommended: price change';
-        actionEl.className = 'rca-remediation price-driven';
-      } else if (cls === 'traffic_driven') {
-        actionEl.textContent = 'Proposed Action: RateLimit / ConcurrencyCap proposed (traffic volume throttle)';
-        actionEl.className = 'rca-remediation';
-      } else if (cls === 'volume_drop_cost_flat') {
-        actionEl.textContent = 'Proposed Action: Alert-only capacity audit';
-        actionEl.className = 'rca-remediation';
-      } else {
-        actionEl.textContent = 'Proposed Action: —';
-        actionEl.className = 'rca-remediation';
-      }
-    }
-  }
-}
-
-// ============================================================
-// Eval Table
-// ============================================================
-class EvalPanel {
-  constructor() {
-    this._history = [];
-    this._evalData = { precision: null, recall: null, f1: null, false_alarms_per_day: null };
-    this._renderPending = false;
-    bus.on('eval', d => this._onEval(d));
-  }
-  _onEval(d) {
-    this._evalData = d;
-    this._scheduleRender();
-  }
-  updateHistory(h) {
-    this._history = h.slice(-10);
-    this._scheduleRender();
-  }
-  _scheduleRender() {
-    if (this._renderPending) return;
-    this._renderPending = true;
-    requestAnimationFrame(() => {
-      this._renderPending = false;
-      this._render();
-    });
-  }
-  _render() {
-    const d = this._evalData;
-    const p = d.precision != null ? (d.precision*100).toFixed(1) + '%' : '—';
-    const r = d.recall    != null ? (d.recall*100).toFixed(1) + '%' : '—';
-    const f = d.f1        != null ? (d.f1*100).toFixed(1) + '%' : '—';
-    const fa = d.false_alarms_per_day != null ? d.false_alarms_per_day.toFixed(2) : '—';
-    const summary = $('#eval-summary');
-    if (summary) summary.innerHTML = `
-      <div class="eval-metric">P <span>${p}</span></div>
-      <div class="eval-metric">R <span>${r}</span></div>
-      <div class="eval-metric">F1 <span>${f}</span></div>
-      <div class="eval-metric">FA/day <span>${fa}</span></div>`;
-
-    const tbody = $('#eval-tbody');
-    if (!tbody) return;
-    tbody.innerHTML = this._history.slice().reverse().map(h => `
-      <tr>
-        <td>${(h.injection_id||'').slice(0,8)}</td>
-        <td>${h.type||'—'}</td>
-        <td>${SVC_SHORT[h.service]||h.service||'—'}</td>
-        <td>${h.latency_wall_s != null ? h.latency_wall_s.toFixed(1)+'s' : '—'}</td>
-        <td>${h.first_detector||'—'}</td>
-        <td class="${h.detected ? 'badge-ok' : 'badge-miss'}">${h.detected ? '✓' : '✗'}</td>
-      </tr>`).join('');
-  }
-}
-
-// ============================================================
-// API helper
-// ============================================================
-async function apiFetch(method, path, body) {
-  try {
-    const opts = { method, headers: { 'Content-Type': 'application/json' } };
-    if (body !== null) opts.body = JSON.stringify(body);
-    const res = await fetch(path, opts);
-    if (!res.ok) {
-      const err = await res.text().catch(() => res.statusText);
-      showToast('API error: ' + err, 'error');
-      return null;
-    }
-    return method !== 'DELETE' ? res.json() : null;
-  } catch(e) {
-    showToast('Network error: ' + e.message, 'error');
-    return null;
-  }
-}
-
-// ============================================================
-// Replay mode detection
-// ============================================================
-function checkReplayMode() {
-  const params = new URLSearchParams(location.search);
-  if (params.has('replay')) {
-    $('#replay-banner').classList.add('visible');
-    $('#replay-banner').textContent = '⏺ REPLAY MODE — ' + (params.get('replay') || 'recorded session');
-    document.title = '[REPLAY] ' + document.title;
-  }
-}
-
-// ============================================================
-// Remediation Manager
-// ============================================================
-class RemediationManager {
-  constructor() {
-    this._proposals = [];
-    this._mode = 'DRY_RUN';
-    this._killSwitch = false;
-    this._totalSavings = 0.0;
-    this._renderPending = false;
-
-    bus.on('remediation_proposal', p => this._onProposal(p));
-    bus.on('mitigation', m => this._onMitigation(m));
-    bus.on('remediation_result', r => this._onResult(r));
-
-    this._bindControls();
-    this._fetchInitialState();
-  }
-
-  _bindControls() {
-    const btnMode = $('#btn-remed-mode');
-    const btnKill = $('#btn-kill-switch');
-    const modal = $('#enforce-modal');
-    const modalCancel = $('#modal-cancel-btn');
-    const modalConfirm = $('#modal-confirm-btn');
-
-    if (btnMode) {
-      btnMode.addEventListener('click', () => {
-        if (this._mode === 'DRY_RUN') {
-          if (modal) modal.classList.add('visible');
-        } else {
-          this._setMode('DRY_RUN');
-        }
-      });
-    }
-
-    if (modalCancel && modal) {
-      modalCancel.addEventListener('click', () => {
-        modal.classList.remove('visible');
-      });
-    }
-
-    if (modalConfirm && modal) {
-      modalConfirm.addEventListener('click', async () => {
-        modal.classList.remove('visible');
-        await this._setMode('ENFORCE');
-      });
-    }
-
-    if (btnKill) {
-      btnKill.addEventListener('click', async () => {
-        await this._setKillSwitch(!this._killSwitch);
-      });
-    }
-  }
-
-  async _fetchInitialState() {
-    try {
-      const state = await apiFetch('GET', '/api/remediation/state', null);
-      if (state) {
-        this._mode = state.mode || 'DRY_RUN';
-        this._killSwitch = !!state.kill_switch;
-        this._updateHeaderButtons();
-      }
-    } catch(e) {}
-  }
-
-  async _setMode(newMode) {
-    const res = await apiFetch('POST', '/api/remediation/mode', { mode: newMode });
-    if (res && res.mode) {
-      this._mode = res.mode;
-      this._updateHeaderButtons();
-      showToast('Remediation mode set to ' + res.mode, res.mode === 'ENFORCE' ? 'warn' : 'info');
-    }
-  }
-
-  async _setKillSwitch(enabled) {
-    const res = await apiFetch('POST', '/api/remediation/kill-switch', { enabled });
-    if (res && res.kill_switch !== undefined) {
-      this._killSwitch = res.kill_switch;
-      this._updateHeaderButtons();
-      showToast(
-        this._killSwitch ? 'Emergency Kill-Switch ENGAGED — All actions blocked!' : 'Kill-Switch Disengaged',
-        this._killSwitch ? 'error' : 'success'
-      );
-    }
-  }
-
-  _updateHeaderButtons() {
-    const btnMode = $('#btn-remed-mode');
-    if (btnMode) {
-      btnMode.textContent = `Mode: ${this._mode}`;
-      btnMode.className = `ctrl-btn ${this._mode === 'ENFORCE' ? 'danger' : ''}`;
-    }
-
-    const btnKill = $('#btn-kill-switch');
-    if (btnKill) {
-      btnKill.textContent = `Kill Switch: ${this._killSwitch ? 'ON' : 'OFF'}`;
-      btnKill.className = `ctrl-btn ${this._killSwitch ? 'kill-switch-active danger' : ''}`;
-    }
-
-    const savingsEl = $('#savings-counter');
-    if (savingsEl) {
-      savingsEl.textContent = `💰 Savings: $${this._totalSavings.toFixed(2)}`;
-    }
-  }
-
-  _onProposal(p) {
-    const idx = this._proposals.findIndex(x => x.proposal_id === p.proposal_id);
-    if (idx >= 0) {
-      this._proposals[idx] = p;
-    } else {
-      this._proposals.unshift(p);
-      if (this._proposals.length > 50) this._proposals.pop();
-    }
-
-    if (p.estimated_savings_hourly && p.status === 'applied') {
-      this._totalSavings += (p.estimated_savings_hourly / 12.0);
-      this._updateHeaderButtons();
-    }
-
-    this._scheduleRender();
-  }
-
-  _onMitigation(m) {
-    if (m.event === 'start') {
-      showToast(`Active mitigation applied to ${m.service} (factor=${m.factor})`, 'info');
-    } else if (m.event === 'end') {
-      showToast(`Mitigation ended for ${m.service}`, 'info');
-    }
-  }
-
-  _onResult(r) {
-    if (r.estimated_savings_usd) {
-      this._totalSavings += r.estimated_savings_usd;
-      this._updateHeaderButtons();
-    }
-  }
-
-  loadHistory(proposals) {
-    if (!proposals || !proposals.length) return;
-    this._proposals = [...proposals].reverse();
-    this._scheduleRender();
-  }
-
-  _scheduleRender() {
-    if (this._renderPending) return;
-    this._renderPending = true;
-    requestAnimationFrame(() => {
-      this._renderPending = false;
-      this._render();
-    });
-  }
-
-  _render() {
-    const tbody = $('#remediation-tbody');
-    const summary = $('#remed-status-summary');
-    if (!tbody) return;
-
-    if (this._proposals.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);font-size:0.85em;">No remediation proposals yet</td></tr>';
-      if (summary) summary.textContent = '0 active';
-      return;
-    }
-
-    const activeCount = this._proposals.filter(p => p.status === 'applied').length;
-    if (summary) summary.textContent = `${activeCount} applied / active`;
-
-    tbody.innerHTML = this._proposals.slice(0, 15).map(p => {
-      const timeStr = fmtSimTs(p.sim_ts);
-      const svc = SVC_SHORT[p.service] || p.service;
-      const act = (p.action || '').replace(/_/g, ' ');
-      const sav = '$' + (p.estimated_savings_hourly || 0).toFixed(2) + '/hr';
-      const risk = ((p.estimated_risk || 0) * 100).toFixed(0) + '%';
-      const statusCls = `badge-${p.status}`;
-      const statusLabel = (p.status || '').replace(/_/g, ' ');
-
-      let controls = '—';
-      if (p.status === 'pending_approval') {
-        controls = `
-          <button class="btn-approve" onclick="remediationManager.approve('${p.proposal_id}')">Approve</button>
-          <button class="btn-reject" onclick="remediationManager.reject('${p.proposal_id}')">Reject</button>
-        `;
-      }
-
-      return `
-        <tr title="${p.reason || ''}">
-          <td>${timeStr}</td>
-          <td><strong>${svc}</strong></td>
-          <td>${act}</td>
-          <td style="color:var(--c-ok);">${sav}</td>
-          <td>${risk}</td>
-          <td><span class="badge ${statusCls}">${statusLabel}</span></td>
-          <td>${controls}</td>
-        </tr>
-      `;
-    }).join('');
-  }
-
-  async approve(id) {
-    showToast(`Approving proposal ${id.slice(0, 8)}...`, 'info');
-    const res = await apiFetch('POST', `/api/remediation/proposals/${id}/approve`, {});
-    if (res && res.status === 'applied') {
-      showToast(`Proposal ${id.slice(0, 8)} applied in ENFORCE mode!`, 'success');
-      const p = this._proposals.find(x => x.proposal_id === id);
-      if (p) p.status = 'applied';
-      this._scheduleRender();
-    }
-  }
-
-  async reject(id) {
-    const res = await apiFetch('POST', `/api/remediation/proposals/${id}/reject`, {});
-    if (res && res.status === 'rejected') {
-      showToast(`Proposal ${id.slice(0, 8)} rejected.`, 'info');
-      const p = this._proposals.find(x => x.proposal_id === id);
-      if (p) p.status = 'rejected';
-      this._scheduleRender();
-    }
-  }
-}
-
-// ============================================================
-// Bootstrap
-// ============================================================
-let injectPanel, stopwatchPanel, alertFeed, rcaPanel, evalPanel, chartManager, topBar, remediationManager;
-
-document.addEventListener('DOMContentLoaded', async () => {
-  checkReplayMode();
-
-  topBar       = new TopBar();
-  chartManager = new ChartManager();
-  injectPanel  = new InjectPanel();
-  stopwatchPanel = new StopwatchPanel();
-  alertFeed    = new AlertFeed();
-  rcaPanel     = new RCAPanel();
-  evalPanel    = new EvalPanel();
-  remediationManager = new RemediationManager();
-  window.remediationManager = remediationManager;
-
-  // Load history for chart restore
-  const hist = await apiFetch('GET', '/history?minutes=60', null);
-  if (hist) {
-    chartManager.loadHistory(hist);
-    alertFeed.loadHistory(hist.detections || []);
-    remediationManager.loadHistory(hist.proposals || []);
-  }
-
-  // Wire SSE bus to components
-  bus.on('state', d => {
-    topBar.update(d);
-    if (d.new_run) {
-      store.reset();
-      showToast('New generator run started (run_id: ' + (d.run_id||'').slice(0,8) + ')', 'info', 6000);
-    }
-    if (d.replay) {
-      $('#replay-banner').classList.add('visible');
-    }
-  });
-  bus.on('tick', d => {}); // chart manager handles via bus.on('tick')
-
-  // Start SSE
-  new SSEClient('/stream');
+// ---------------------------------------------------------------------------
+// Helpers & Constants
+// ---------------------------------------------------------------------------
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+
+const SV = ['AmazonApiGateway', 'EC2 Data Transfer', 'DynamoDB', 'CloudWatch Logs', 'S3 PUT'];
+const LB = {
+  AmazonApiGateway: 'API GW',
+  'EC2 Data Transfer': 'EC2',
+  DynamoDB: 'DynamoDB',
+  'CloudWatch Logs': 'CW Logs',
+  'S3 PUT': 'S3'
+};
+
+const PRE = [
+  { type: 'spike', service: 'DynamoDB', magnitude: 4, duration_min: 30, ramp_min: 0 },
+  { type: 'cost_only', service: 'DynamoDB', magnitude: 5, duration_min: 20, ramp_min: 0 },
+  { type: 'slow_drift', service: 'DynamoDB', magnitude: 3, duration_min: 60, ramp_min: 0 },
+  { type: 'spike', service: 'all', magnitude: 2, duration_min: 30, ramp_min: 0 }
+];
+
+const S = {
+  tk: {},
+  tot: new Map(),
+  det: new Map(),
+  inj: new Map(),
+  prop: new Map(),
+  run: '',
+  paused: false,
+  range: 60,
+  gt: false,
+  sel: null,
+  watch: null,
+  last: null,
+  saved: 0,
+  results: 0,
+  mode: 'DRY_RUN',
+  kill: false,
+  fs: 'all',
+  fv: 'all',
+  pf: 'Pending',
+  ev: {},
+  now: 0
+};
+SV.forEach(s => { S.tk[s] = []; });
+
+const T = i => Date.parse(i) || 0;
+const hm = t => new Date(t).toISOString().slice(11, 16);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;'
+}[c]));
+
+const $$$ = (o, k) => {
+  for (const x of k) {
+    if (o && o[x] != null) return o[x];
+  }
+};
+
+const pct = v => v == null ? '—' : ((v <= 1 ? v * 100 : v).toFixed(1) + '%');
+const usd = v => v == null || isNaN(v) ? '—' : '$' + (+v).toFixed(v < 1 ? 4 : 2);
+
+const api = (m, u, b) => fetch(u, {
+  method: m,
+  headers: { 'Content-Type': 'application/json' },
+  body: b ? JSON.stringify(b) : undefined
+}).then(async r => {
+  if (!r.ok) throw new Error((await r.text()).slice(0, 140));
+  return r.json().catch(() => ({}));
 });
 
+const toast = t => {
+  const e = $('#toast');
+  if (!e) return;
+  e.textContent = t;
+  e.style.display = 'block';
+  clearTimeout(toast.h);
+  toast.h = setTimeout(() => { e.style.display = 'none'; }, 3500);
+};
+
+const act = (p, ok) => p.then(ok).catch(e => toast('Failed: ' + e.message));
+const isPend = p => /pend|propos/i.test(p.status || '');
+const isApp = p => /appl|approv|mitig/i.test(p.status || '');
+
+const names = d => {
+  const v = d.detector_votes;
+  if (Array.isArray(v)) {
+    return v.filter(x => x.is_anomaly || x.vote || x.fired)
+      .map(x => x.detector_name || x.detector || x.name)
+      .filter(Boolean);
+  }
+  return v && typeof v === 'object' ? Object.keys(v).filter(k => v[k]) : [];
+};
+
+let dirty = false;
+const draw = () => {
+  if (!dirty) {
+    dirty = true;
+    requestAnimationFrame(() => {
+      dirty = false;
+      render();
+    });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Ingest & State Management
+// ---------------------------------------------------------------------------
+function clearAll() {
+  SV.forEach(s => { S.tk[s] = []; });
+  S.tot.clear();
+  S.det.clear();
+  S.inj.clear();
+  S.prop.clear();
+  S.watch = null;
+  S.last = null;
+}
+
+function addTick(d) {
+  if (!SV.includes(d.service)) return;
+  if (S.run && d.run_id && d.run_id !== S.run) {
+    clearAll();
+    toast('New run started');
+  }
+  if (d.run_id) S.run = d.run_id;
+
+  const t = T(d.sim_ts);
+  const c = +d.cost || 0;
+  const e = +(d.expected_cost ?? d.cost) || 0;
+  const a = S.tk[d.service];
+
+  a.push({ t, c, e });
+  if (a.length > 1500) a.shift();
+
+  const o = S.tot.get(t) || { c: 0, e: 0 };
+  o.c += c;
+  o.e += e;
+  S.tot.set(t, o);
+  if (S.tot.size > 1500) S.tot.delete(S.tot.keys().next().value);
+  S.now = Math.max(S.now, t);
+}
+
+function addDet(d) {
+  const id = d.detection_id;
+  const t = T(d.sim_ts);
+  const o = S.det.get(id);
+
+  if (o) {
+    o.end = Math.max(o.end, t);
+    o.status = d.status || o.status;
+    o.sev = d.severity ?? o.sev;
+    o.rca = d.rca || o.rca;
+  } else {
+    const r = {
+      id,
+      svc: d.service,
+      start: t,
+      end: t,
+      sev: d.severity,
+      votes: names(d),
+      rca: d.rca || {},
+      status: d.status || 'open'
+    };
+    S.det.set(id, r);
+
+    const w = S.watch;
+    if (w && (w.svc === d.service || w.svc === 'all') && !S.last) {
+      S.last = {
+        lat: (Date.now() - w.t0) / 1000,
+        svc: d.service,
+        by: r.votes.join(' + ') || 'ensemble'
+      };
+      S.watch = null;
+    }
+  }
+}
+
+function addProp(p) {
+  if (p && p.proposal_id) {
+    S.prop.set(p.proposal_id, { ...(S.prop.get(p.proposal_id) || {}), ...p });
+  }
+}
+
+function addInj(d) {
+  if (d.injection_id) {
+    S.inj.set(d.injection_id, { ...(S.inj.get(d.injection_id) || {}), ...d });
+  }
+}
+
+function onState(d) {
+  if (d.run_id && S.run && d.run_id !== S.run && d.new_run) {
+    clearAll();
+  }
+  if (d.run_id) S.run = d.run_id;
+  if (d.paused != null) S.paused = !!d.paused;
+  (d.active_injections || d.injections || []).forEach(addInj);
+}
+
+// ---------------------------------------------------------------------------
+// SVG Charts
+// ---------------------------------------------------------------------------
+function lineChart() {
+  const all = Array.from(S.tot).slice(-Math.max(3, Math.round(S.range / 5)));
+  if (all.length < 2) {
+    return '<div class="empty">Waiting for data. Start the generator and detector.</div>';
+  }
+
+  const W = 900;
+  const H = 300;
+  const P = 250;
+  const t0 = all[0][0];
+  const t1 = all.at(-1)[0] || t0 + 1;
+  const mx = Math.max(...all.map(([, v]) => Math.max(v.c, v.e))) * 1.1 || 1;
+
+  const X = t => (t - t0) / (t1 - t0 || 1) * W;
+  const Y = v => P - (v / mx) * (P - 20);
+  const pl = k => all.map(([t, v], i) => (i ? 'L' : 'M') + X(t).toFixed(1) + ',' + Y(v[k]).toFixed(1)).join('');
+
+  let g = '';
+  for (let i = 0; i < 4; i++) {
+    g += `<line class="gl" x1="0" x2="${W}" y1="${40 + i * 70}" y2="${40 + i * 70}"/>`;
+  }
+
+  if (S.gt) {
+    S.inj.forEach(j => {
+      const a = T(j.sim_start_ts || j.start_sim_ts);
+      const b = T(j.sim_end_ts || j.end_sim_ts) || t1;
+      if (a && b > t0 && a < t1) {
+        g += `<rect x="${X(Math.max(a, t0))}" y="0" width="${Math.max(2, X(Math.min(b, t1)) - X(Math.max(a, t0)))}" height="${P}" fill="var(--crit)" opacity=".1"/>`;
+      }
+    });
+  }
+
+  g += `<path d="${pl('e')}" fill="none" stroke="var(--c1)" stroke-opacity=".18" stroke-width="30"/>
+        <path d="${pl('e')}" fill="none" stroke="var(--mut)" stroke-width="2" stroke-dasharray="6 5"/>
+        <path d="${pl('c')}" fill="none" stroke="var(--c1)" stroke-width="3"/>`;
+
+  S.det.forEach(d => {
+    if (d.start < t0 || d.start > t1) return;
+    const n = all.reduce((a, b) => Math.abs(b[0] - d.start) < Math.abs(a[0] - d.start) ? b : a);
+    g += `<circle cx="${X(n[0])}" cy="${Y(n[1].c)}" r="7" fill="var(--crit)" stroke="var(--surf)" stroke-width="2">
+            <title>${esc(LB[d.svc] || d.svc)} · severity ${Math.round(d.sev || 0)}</title>
+          </circle>`;
+  });
+
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Total cost over time">
+    ${g}
+    <text x="0" y="284" class="ax">${hm(t0)}</text>
+    <text x="${W / 2 - 20}" y="284" class="ax">${hm((t0 + t1) / 2)}</text>
+    <text x="${W - 40}" y="284" class="ax">${hm(t1)}</text>
+  </svg>`;
+}
+
+function stackChart() {
+  const n = 6;
+  const cols = ['--c1', '--c2', '--c3', '--c4', '--c5'];
+  const L = SV.map(s => S.tk[s].slice(-n));
+  if (!L[0] || !L[0].length) return '<div class="empty">No data yet.</div>';
+
+  const m = L[0].length;
+  const tot = i => L.reduce((a, l) => a + ((l[l.length - m + i] || {}).c || 0), 0);
+  const mx = Math.max(...Array.from({ length: m }, (_, i) => tot(i))) || 1;
+
+  let g = '<line class="gl" x1="0" x2="520" y1="250" y2="250"/>';
+  for (let i = 0; i < m; i++) {
+    let y = 250;
+    L.forEach((l, k) => {
+      const h = (((l[l.length - m + i] || {}).c || 0) / mx) * 220;
+      y -= h;
+      g += `<rect x="${20 + i * 82}" y="${y}" width="56" height="${h}" fill="var(${cols[k]})"/>`;
+    });
+    g += `<text x="${20 + i * 82}" y="272" class="ax">${hm((L[0][L[0].length - m + i] || {}).t || 0)}</text>`;
+  }
+
+  return `<svg viewBox="0 0 520 280" role="img" aria-label="Stacked cost by service">${g}</svg>`;
+}
+
+function timeline() {
+  const t1 = S.now;
+  const t0 = t1 - S.range * 60000;
+  if (!t1) return '<div class="empty">No data yet.</div>';
+
+  const X = t => 110 + (Math.min(Math.max(t, t0), t1) - t0) / (t1 - t0 || 1) * 770;
+  let g = '';
+
+  SV.forEach((s, i) => {
+    const y = 40 + i * 46;
+    g += `<text x="0" y="${y + 4}" class="ax">${LB[s]}</text>
+          <line class="gl" x1="110" x2="880" y1="${y + 16}" y2="${y + 16}"/>`;
+  });
+
+  S.det.forEach(d => {
+    const i = SV.indexOf(d.svc);
+    if (i < 0 || d.end < t0) return;
+    const y = 40 + i * 46;
+    const x = X(d.start);
+    const w = Math.max(8, X(Math.max(d.end, d.start)) - x);
+    const open = d.status !== 'closed';
+    const hi = (d.sev || 0) >= 60;
+
+    g += `<g data-act="sel" data-id="${esc(d.id)}" style="cursor:pointer">
+            <rect x="${x}" y="${y + 2}" width="${w}" height="28" rx="6" fill="${open ? (hi ? 'var(--crit)' : 'var(--c3)') : 'var(--bd2)'}"/>
+            <text x="${x + 8}" y="${y + 20}" style="font:600 12px system-ui;fill:${open && hi ? 'var(--onc)' : open ? '#1B222B' : 'var(--tx)'}">
+              ${Math.round(d.sev || 0)}${open ? ' · open' : ' · resolved'}
+            </text>
+          </g>`;
+  });
+
+  return `<svg viewBox="0 0 900 270" role="img" aria-label="Incident timeline">
+    <text x="110" y="262" class="ax">${hm(t0)}</text>
+    <text x="840" y="262" class="ax">${hm(t1)}</text>
+    ${g}
+  </svg>
+  <p class="muted" style="margin:4px 0 0;font-size:12px">Bars run from detection to resolution. Select a bar to open its incident.</p>`;
+}
+
+// ---------------------------------------------------------------------------
+// Views & Incident Cards
+// ---------------------------------------------------------------------------
+const WHY = {
+  traffic_driven: 'Cost and volume both rose. This looks like real demand, not a configuration change.',
+  price_driven: 'Cost per request rose while volume stayed flat. This looks like a pricing or configuration change. Throttling will not help.',
+  volume_drop_cost_flat: 'Volume dropped but cost stayed flat. Possible orphaned provisioned capacity or fixed charges.'
+};
+
+function incCard(d, full) {
+  const c = d.rca && (d.rca.classification || d.rca.alert_type);
+  const p = [...S.prop.values()].find(x => x.detection_id === d.id);
+  const hi = (d.sev || 0) >= 60;
+
+  const btn = p && isPend(p)
+    ? `<button class="btn ok" data-act="approve" data-id="${esc(p.proposal_id)}">Approve</button>
+       <button class="btn" data-act="reject" data-id="${esc(p.proposal_id)}">Reject</button>`
+    : '';
+
+  const acts = c === 'price_driven'
+    ? '<span class="muted">Recommended: investigate the configuration change.</span>'
+    : btn;
+
+  return `<div class="inc${S.sel === d.id ? ' sel' : ''}" data-act="sel" data-id="${esc(d.id)}">
+    <div class="row">
+      <span class="sev${hi ? '' : ' lo'}">${Math.round(d.sev || 0)}</span>
+      <b>${esc(LB[d.svc] || d.svc)}</b>
+      <span class="sp"></span>
+      <span class="tag">${esc((c || d.status || '').replace(/_/g, ' '))}</span>
+    </div>
+    ${full ? `<div class="note">${esc(WHY[c] || 'Waiting for root-cause analysis.')}</div>` : ''}
+    <div class="row" style="margin-top:8px">${acts}</div>
+  </div>`;
+}
+
+const set = (id, h) => {
+  const e = document.getElementById(id);
+  if (e && e.innerHTML !== h) e.innerHTML = h;
+};
+
+const txt = (id, v) => {
+  const e = document.getElementById(id);
+  if (e && e.textContent !== String(v)) e.textContent = v;
+};
+
+const chips = (id, items, cur, act) => {
+  set(id, items.map(i => `<button class="chip${i == cur ? ' on' : ''}" data-act="${act}" data-v="${i}">${i}</button>`).join(' '));
+};
+
+function render() {
+  const pg = (location.hash || '#overview').slice(1);
+  $$('.page').forEach(e => e.classList.toggle('on', e.id === 'p-' + pg));
+  $$('.nav').forEach(a => a.classList.toggle('on', a.hash === '#' + pg));
+  txt('title', pg[0].toUpperCase() + pg.slice(1));
+
+  const lt = S.now;
+  const tc = [...S.tot.values()].at(-1);
+  const open = [...S.det.values()].filter(d => d.status !== 'closed');
+  const pend = [...S.prop.values()].filter(isPend);
+
+  txt('clock', 'Sim ' + (lt ? hm(lt) : '—'));
+  txt('pause', S.paused ? 'Resume' : 'Pause');
+  txt('kill', 'Kill switch: ' + (S.kill ? 'ON' : 'off'));
+  if ($('#kill')) $('#kill').classList.toggle('bad', S.kill);
+  if ($('#m-dry')) $('#m-dry').classList.toggle('on', S.mode === 'DRY_RUN');
+  if ($('#m-enf')) $('#m-enf').classList.toggle('on', S.mode === 'ENFORCE');
+  txt('run', S.run ? 'Run ' + S.run.slice(0, 8) : '');
+
+  document.querySelectorAll('[data-range]').forEach(e => {
+    const h = [15, 60, 360, 1440].map(m =>
+      `<button class="chip${m === S.range ? ' on' : ''}" data-act="range" data-v="${m}">${m < 60 ? m + 'm' : (m / 60) + 'h'}</button>`
+    ).join(' ');
+    if (e.innerHTML !== h) e.innerHTML = h;
+  });
+
+  if (pg === 'overview') {
+    txt('k-cost', tc ? usd(tc.c) : '—');
+    txt('k-open', open.length);
+    txt('k-open2', open.length ? open.map(d => LB[d.svc] || d.svc).join(', ') : 'none');
+
+    const w = S.watch;
+    const l = S.last;
+    txt('k-lat', l ? l.lat.toFixed(1) + ' s' : w ? ((Date.now() - w.t0) / 1000).toFixed(0) + ' s…' : '—');
+    txt('k-by', l ? l.svc + ' · ' + l.by : w ? 'waiting for detection' : 'inject an anomaly to measure');
+    txt('k-sav', '$' + pend.reduce((a, p) => a + (+p.estimated_savings_hourly || 0), 0).toFixed(2) + '/hr');
+
+    set('c-cost', lineChart());
+    set('o-inc', open.length ? open.slice(-3).reverse().map(d => incCard(d, 1)).join('') : '<div class="empty">No open incidents.</div>');
+
+    const q = S.ev;
+    txt('q-p', pct($$$(q, ['precision', 'running_precision', 'p'])));
+    txt('q-r', pct($$$(q, ['recall', 'running_recall', 'r'])));
+    txt('q-f', pct($$$(q, ['f1', 'running_f1'])));
+    txt('q-a', $$$(q, ['fa_per_day', 'false_alarms_per_day', 'fa_day'])?.toFixed?.(2) ?? '—');
+
+    set('active', [...S.inj.values()]
+      .filter(j => !j.ended && !j.sim_end_reached && j.status !== 'ended')
+      .slice(-4)
+      .map(j => `<div class="row">${esc(j.type)} · ${esc(LB[j.service] || j.service)} <button class="chip" data-act="end" data-id="${esc(j.injection_id)}">End now</button></div>`)
+      .join('') || 'No active injections.');
+  }
+
+  if (pg === 'monitoring') {
+    set('c-stack', stackChart());
+    set('leg', SV.map((s, i) => `<span><i style="background:var(--c${i + 1})"></i>${LB[s]}</span>`).join(''));
+    set('tiles', SV.map(s => {
+      const a = S.tk[s].at(-1);
+      const dv = a && a.e ? ((a.c / a.e) - 1) * 100 : 0;
+      const w = Math.abs(dv) > 50;
+      return `<div class="tile${w ? ' warn' : ''}">
+        <span class="muted">${LB[s]}</span>
+        <b style="display:block;font-size:20px">${a ? usd(a.c) : '—'}</b>
+        <span style="color:var(${w ? '--crit' : '--ok'});font-weight:600">
+          ${a ? (w ? (dv > 0 ? '+' : '') + dv.toFixed(0) + '% vs expected' : 'Normal') : 'No data'}
+        </span>
+      </div>`;
+    }).join(''));
+  }
+
+  if (pg === 'intelligence') {
+    set('c-tl', timeline());
+    const d = S.det.get(S.sel) || [...S.det.values()].at(-1);
+    set('i-det', d ? incCard(d, 1) : '<div class="empty">No incidents yet. Inject an anomaly to see one here.</div>');
+
+    const r = (d && d.rca) || {};
+    set('i-why', d ? `
+      <div class="row">
+        <div class="stat"><span class="muted">Cost / 1k now</span><b>${usd(r.cost_per_1k_now)}</b></div>
+        <div class="stat"><span class="muted">Baseline</span><b>${usd(r.cost_per_1k_baseline)}</b></div>
+      </div>
+      <p style="margin:12px 0 6px"><b>Detectors that voted</b></p>
+      <p class="muted" style="margin:0">${esc(d.votes.join(', ') || '—')}</p>` : '<div class="empty">Select an incident.</div>');
+  }
+
+  if (pg === 'remediation') {
+    const P = [...S.prop.values()].reverse();
+    txt('r-mode', S.mode === 'ENFORCE' ? 'Enforce' : 'Dry run');
+    txt('r-pend', pend.length);
+    txt('r-app', P.filter(isApp).length);
+    txt('r-sav', '$' + S.saved.toFixed(2));
+    chips('r-f', ['Pending', 'Applied', 'Rejected', 'All'], S.pf, 'pf');
+
+    const F = P.filter(p => S.pf === 'All' || (S.pf === 'Pending' ? isPend(p) : S.pf === 'Applied' ? isApp(p) : /reject|block/i.test(p.status || '')));
+
+    set('r-tab', F.length ? `
+      <table>
+        <tr>
+          <th>Time</th>
+          <th>Service</th>
+          <th>Action</th>
+          <th>Est. savings</th>
+          <th>Risk</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+        ${F.map(p => `
+          <tr>
+            <td>${p.sim_ts ? hm(T(p.sim_ts)) : '—'}</td>
+            <td><b>${esc(LB[p.service] || p.service)}</b></td>
+            <td>${esc(String(p.action || '').replace(/_/g, ' '))}</td>
+            <td>${usd(p.estimated_savings_hourly)}/hr</td>
+            <td>${pct(p.estimated_risk)}</td>
+            <td><span class="tag">${esc(p.status)}</span></td>
+            <td>
+              ${isPend(p) ? `
+                <button class="btn ok" data-act="approve" data-id="${esc(p.proposal_id)}">Approve</button>
+                <button class="btn" data-act="reject" data-id="${esc(p.proposal_id)}">Reject</button>
+              ` : ''}
+            </td>
+          </tr>
+        `).join('')}
+      </table>
+    ` : '<div class="empty">No proposals in this view.</div>');
+  }
+
+  if (pg === 'history') {
+    chips('h-s', ['all', 'open', 'resolved'], S.fs, 'fs');
+    chips('h-v', ['all', ...SV.map(s => LB[s])], S.fv === 'all' ? 'all' : LB[S.fv], 'fv');
+
+    const R = [...S.det.values()]
+      .filter(d => (S.fs === 'all' || (S.fs === 'open') === (d.status !== 'closed')) && (S.fv === 'all' || d.svc === S.fv))
+      .sort((a, b) => b.start - a.start);
+
+    set('h-tab', R.length ? `
+      <table>
+        <tr>
+          <th>Detected</th>
+          <th>Service</th>
+          <th>Severity</th>
+          <th>Cause</th>
+          <th>Lifecycle</th>
+        </tr>
+        ${R.map(d => {
+          const p = [...S.prop.values()].find(x => x.detection_id === d.id);
+          const n = 1 + (p ? 1 : 0) + (p && isApp(p) ? 1 : 0) + (d.status === 'closed' ? 1 : 0);
+          const rcaCause = (d.rca && (d.rca.classification || d.rca.alert_type)) || '—';
+          return `
+            <tr>
+              <td>${hm(d.start)}</td>
+              <td><b>${esc(LB[d.svc] || d.svc)}</b></td>
+              <td><span class="sev${(d.sev || 0) >= 60 ? '' : ' lo'}">${Math.round(d.sev || 0)}</span></td>
+              <td>${esc(rcaCause.replace(/_/g, ' '))}</td>
+              <td>
+                <span class="stp">
+                  ${[0, 1, 2, 3].map(k => `<i class="${k < n ? 'on' : ''}"></i>`).join('')}
+                </span>
+                ${['Detected', 'Proposed', 'Mitigated', 'Resolved'][n - 1]}
+              </td>
+            </tr>
+          `;
+        }).join('')}
+      </table>
+    ` : '<div class="empty">No incidents match these filters.</div>');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Actions & Interactions
+// ---------------------------------------------------------------------------
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-act]');
+  if (!b) return;
+
+  const a = b.dataset.act;
+  const id = b.dataset.id;
+  const v = b.dataset.v;
+
+  if (a === 'sel') {
+    S.sel = id;
+    if (location.hash !== '#intelligence') location.hash = '#intelligence';
+    draw();
+  } else if (a === 'range') {
+    S.range = +v;
+    draw();
+  } else if (a === 'pf') {
+    S.pf = v;
+    draw();
+  } else if (a === 'fs') {
+    S.fs = v;
+    draw();
+  } else if (a === 'fv') {
+    S.fv = v === 'all' ? 'all' : SV.find(s => LB[s] === v);
+    draw();
+  } else if (a === 'theme') {
+    const d = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = d;
+    localStorage.setItem('crip-theme', d);
+    txt('theme', d === 'dark' ? 'Light' : 'Dark');
+  } else if (a === 'pause') {
+    act(api('POST', S.paused ? '/api/control/resume' : '/api/control/pause'), () => {
+      S.paused = !S.paused;
+      draw();
+    });
+  } else if (a === 'reset') {
+    if (confirm('Reset the simulation?')) {
+      act(api('POST', '/api/control/reset', {}), () => {
+        clearAll();
+        draw();
+      });
+    }
+  } else if (a === 'mode') {
+    if (v === 'ENFORCE' && !confirm('Enable ENFORCE mode? Real mitigations will be applied to traffic.')) {
+      return;
+    }
+    act(api('POST', '/api/remediation/mode', { mode: v }), () => {
+      S.mode = v;
+      draw();
+    });
+  } else if (a === 'kill') {
+    act(api('POST', '/api/remediation/kill-switch', { enabled: !S.kill }), () => {
+      S.kill = !S.kill;
+      draw();
+    });
+  } else if (a === 'preset' || a === 'inject') {
+    const body = a === 'preset'
+      ? PRE[+b.dataset.i]
+      : {
+          type: $('#i-type').value,
+          service: $('#i-svc').value,
+          magnitude: +$('#i-mag').value,
+          duration_min: +$('#i-dur').value,
+          ramp_min: +$('#i-ramp').value
+        };
+
+    act(api('POST', '/api/inject', body), r => {
+      S.last = null;
+      S.watch = { t0: Date.now(), svc: body.service };
+      if (r && r.injection_id) addInj({ ...body, ...r });
+      toast('Injected: ' + body.type);
+
+      setTimeout(() => {
+        if (S.watch && !S.last) {
+          S.watch = null;
+          S.last = { lat: NaN, svc: body.service, by: 'missed' };
+          txt('k-lat', 'Missed');
+          draw();
+        }
+      }, 60000);
+      draw();
+    });
+  } else if (a === 'end') {
+    act(api('DELETE', '/api/inject/' + id), () => {
+      const j = S.inj.get(id);
+      if (j) j.ended = true;
+      draw();
+    });
+  } else if (a === 'approve' || a === 'reject') {
+    act(api('POST', `/api/remediation/proposals/${id}/${a}`), () => {
+      const p = S.prop.get(id);
+      if (p) p.status = a === 'approve' ? 'approved' : 'rejected';
+      draw();
+    });
+  }
+});
+
+// Setup input bindings
+if ($('#speed')) {
+  $('#speed').onchange = e => act(api('POST', '/api/control/speed', { sim_minutes_per_real_second: +e.target.value }), () => {});
+}
+
+if ($('#gt')) {
+  $('#gt').onchange = e => {
+    S.gt = e.target.checked;
+    draw();
+  };
+}
+
+[['mag', '×'], ['dur', ' min'], ['ramp', ' min']].forEach(([k, u]) => {
+  const i = $('#i-' + k);
+  if (i) {
+    i.oninput = () => txt('v-' + k, (k === 'mag' ? (+i.value).toFixed(1) : i.value) + u);
+  }
+});
+
+if ($('#i-svc')) {
+  $('#i-svc').innerHTML = ['all', ...SV].map(s =>
+    `<option value="${s}"${s === 'DynamoDB' ? ' selected' : ''}>${LB[s] || s}</option>`
+  ).join('');
+}
+
+window.addEventListener('hashchange', draw);
+
+// Initial theme setup
+{
+  const t = localStorage.getItem('crip-theme') || (matchMedia('(prefers-color-scheme:dark)').matches ? 'dark' : 'light');
+  document.documentElement.dataset.theme = t;
+  txt('theme', t === 'dark' ? 'Light' : 'Dark');
+}
+
+// ---------------------------------------------------------------------------
+// Realtime Stream Connection (SSE)
+// ---------------------------------------------------------------------------
+function connect() {
+  const es = new EventSource('/stream');
+  const on = (n, f) => es.addEventListener(n, m => {
+    try {
+      f(JSON.parse(m.data));
+      draw();
+    } catch (x) {}
+  });
+
+  es.onopen = () => {
+    const b = $('#banner');
+    if (b) b.style.display = 'none';
+  };
+
+  es.onerror = () => {
+    const b = $('#banner');
+    if (b) b.style.display = 'block';
+  };
+
+  on('tick', addTick);
+  on('detection', addDet);
+  on('injection', addInj);
+  on('eval', d => { S.ev = d.summary || d; });
+  on('state', onState);
+  on('remediation_proposal', addProp);
+  on('remediation_result', d => {
+    S.results++;
+    S.saved += +(d.savings ?? d.net_benefit ?? 0) || 0;
+  });
+  on('mitigation', () => {});
+  on('heartbeat', () => {});
+}
+
+async function health() {
+  try {
+    const h = await (await fetch('/health')).json();
+    [['redis', 'd-redis'], ['generator', 'd-gen'], ['detector', 'd-det']].forEach(([k, id]) => {
+      const e = document.getElementById(id);
+      if (e) {
+        e.className = 'dot ' + (h[k].ok ? 'ok' : 'bad');
+        e.title = h[k].detail || '';
+      }
+    });
+  } catch (x) {
+    ['d-redis', 'd-gen', 'd-det'].forEach(id => {
+      const e = document.getElementById(id);
+      if (e) e.className = 'dot bad';
+    });
+  }
+}
+
+async function boot() {
+  try {
+    const h = await (await fetch('/history?minutes=1440')).json();
+    (h.ticks || []).forEach(addTick);
+    (h.detections || []).forEach(addDet);
+    (h.injections || []).forEach(addInj);
+    (h.proposals || []).forEach(addProp);
+  } catch (x) {}
+
+  try {
+    const r = await (await fetch('/api/remediation/state')).json();
+    S.mode = r.mode || 'DRY_RUN';
+    S.kill = !!r.kill_switch;
+  } catch (x) {}
+
+  try {
+    onState(await (await fetch('/api/state')).json());
+  } catch (x) {}
+
+  connect();
+  health();
+  setInterval(health, 3000);
+  setInterval(() => {
+    if (S.watch) draw();
+  }, 1000);
+
+  draw();
+}
+
+boot();
