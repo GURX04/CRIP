@@ -37,6 +37,12 @@
 
   <button id="btn-pause" class="ctrl-btn">⏸ Pause</button>
   <button id="btn-reset" class="ctrl-btn danger" title="Reset generator run">↺ Reset</button>
+
+  <!-- Remediation Controls -->
+  <button id="btn-remed-mode" class="ctrl-btn" title="Toggle Remediation Mode">Mode: DRY-RUN</button>
+  <button id="btn-kill-switch" class="ctrl-btn" title="Emergency Kill Switch">Kill Switch: OFF</button>
+  <span id="savings-counter" class="savings-chip">💰 Savings: $0.00</span>
+
   <span style="font-size:0.75em;color:var(--text-muted);margin-left:auto">Press F = Presentation mode</span>
 </header>
 
@@ -167,11 +173,46 @@
         <div class="rca-metric"><div class="label">Cost Δ</div><div class="value" id="rca-pct-cost">—</div></div>
         <div class="rca-metric"><div class="label">Volume Δ</div><div class="value" id="rca-pct-volume">—</div></div>
       </div>
+      <div class="rca-remediation" id="rca-remediation-action">Proposed Action: —</div>
+    </div>
+
+    <!-- REMEDIATION PANEL -->
+    <div class="panel" id="remediation-panel">
+      <div class="panel-title" style="display:flex;justify-content:space-between;align-items:center;">
+        <span>🛡 Automated Remediation & Mitigations</span>
+        <span id="remed-status-summary" style="font-size:0.8em;color:var(--text-muted);">0 active</span>
+      </div>
+      <table class="remediation-table">
+        <thead>
+          <tr>
+            <th>Time</th><th>Service</th><th>Action</th><th>Est. Savings</th><th>Risk</th><th>Status</th><th>Controls</th>
+          </tr>
+        </thead>
+        <tbody id="remediation-tbody">
+          <tr><td colspan="7" style="color:var(--text-muted);font-size:0.85em;">No remediation proposals yet</td></tr>
+        </tbody>
+      </table>
     </div>
 
   </div><!-- /right-col -->
 
 </div><!-- /main-layout -->
+
+<!-- Confirmation Modal for ENFORCE mode -->
+<div id="enforce-modal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-title">⚠ Enable ENFORCE Mode?</div>
+    <div class="modal-body">
+      In ENFORCE mode, approved remediation actions (such as rate-limiting and throttling) will actively call the live event generator to throttle requests and reduce traffic volume.
+      <br/><br/>
+      Are you sure you want to switch from DRY-RUN to ENFORCE?
+    </div>
+    <div class="modal-actions">
+      <button id="modal-cancel-btn" class="ctrl-btn">Cancel</button>
+      <button id="modal-confirm-btn" class="ctrl-btn danger">Yes, Enable ENFORCE</button>
+    </div>
+  </div>
+</div>
 
 <!-- ───────────── Scripts ───────────── -->
 <script src="/static/vendor/uplot.min.js"></script>

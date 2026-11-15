@@ -37,8 +37,9 @@ from starlette.background import BackgroundTask
 from dashboard.config import DashboardSettings, get_settings
 from dashboard.models import (
     HealthStatus, ComponentHealth,
-    HistoryResponse, HistoryTick, HistoryDetection, HistoryInjection,
+    HistoryResponse, HistoryTick, HistoryDetection, HistoryInjection, HistoryProposal,
     InjectProxyRequest, SpeedProxyRequest, ResetProxyRequest,
+    RemediationModeRequest, KillSwitchRequest,
     SSEMessage,
 )
 from dashboard.streams import AsyncRedisReader, ClientRegistry, ReaderState
@@ -198,6 +199,19 @@ def create_app(settings: Optional[DashboardSettings] = None) -> FastAPI:
                 except Exception:
                     pass
 
+            # Proposals stream
+            proposals: list[HistoryProposal] = []
+            raw = r.xrevrange(settings.redis_stream_proposals, count=200)
+            for _id, fields in reversed(raw):
+                try:
+                    d = json.loads(fields.get("payload", "{}"))
+                    proposals.append(HistoryProposal(**{
+                        k: v for k, v in d.items()
+                        if k in HistoryProposal.model_fields
+                    }))
+                except Exception:
+                    pass
+
         except Exception as exc:
             log.warning("history redis error: %s — returning empty", exc)
 
@@ -205,6 +219,7 @@ def create_app(settings: Optional[DashboardSettings] = None) -> FastAPI:
             ticks=ticks,
             detections=detections,
             injections=injections,
+            proposals=proposals,
             minutes=minutes,
         )
 
@@ -280,6 +295,135 @@ def create_app(settings: Optional[DashboardSettings] = None) -> FastAPI:
     @app.get("/api/injections")
     async def proxy_injections():
         return await _proxy_get(settings, "/injections")
+
+    # -----------------------------------------------------------------------
+    # Remediation control endpoints
+    # -----------------------------------------------------------------------
+
+    @app.post("/api/remediation/mode")
+    async def set_remediation_mode(body: RemediationModeRequest):
+        """Set remediation mode: DRY_RUN | ENFORCE."""
+        mode_val = body.mode.upper()
+        if mode_val not in ("DRY_RUN", "ENFORCE"):
+            raise HTTPException(status_code=400, detail="Invalid mode. Must be DRY_RUN or ENFORCE.")
+
+        try:
+            import redis as redis_lib  # noqa: PLC0415
+            r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+            r.set("crip:remediation:mode", mode_val)
+            r.publish("crip:remediation:control", json.dumps({"action": "set_mode", "mode": mode_val}))
+        except Exception as exc:
+            log.warning("Could not set mode in redis: %s", exc)
+
+        return {"mode": mode_val, "status": "ok"}
+
+    @app.post("/api/remediation/kill-switch")
+    async def set_kill_switch(body: KillSwitchRequest):
+        """Engage or disengage emergency kill switch."""
+        try:
+            import redis as redis_lib  # noqa: PLC0415
+            r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+            r.set("crip:remediation:kill_switch", "1" if body.enabled else "0")
+            r.publish("crip:remediation:control", json.dumps({"action": "set_kill_switch", "enabled": body.enabled}))
+        except Exception as exc:
+            log.warning("Could not set kill switch in redis: %s", exc)
+
+        return {"kill_switch": body.enabled, "status": "ok"}
+
+    @app.get("/api/remediation/state")
+    async def get_remediation_state():
+        """Get live remediation engine mode and status."""
+        mode = "DRY_RUN"
+        kill_switch = False
+        try:
+            import redis as redis_lib  # noqa: PLC0415
+            r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+            saved_mode = r.get("crip:remediation:mode")
+            if saved_mode:
+                mode = saved_mode
+            saved_ks = r.get("crip:remediation:kill_switch")
+            if saved_ks == "1":
+                kill_switch = True
+        except Exception:
+            pass
+
+        return {"mode": mode, "kill_switch": kill_switch}
+
+    @app.post("/api/remediation/proposals/{proposal_id}/approve")
+    async def approve_remediation_proposal(proposal_id: str):
+        """Approve a pending proposal and apply in generator."""
+        try:
+            import redis as redis_lib  # noqa: PLC0415
+            r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+            # Find proposal payload from stream
+            raw = r.xrevrange(settings.redis_stream_proposals, count=100)
+            target_proposal = None
+            for _id, fields in raw:
+                try:
+                    d = json.loads(fields.get("payload", "{}"))
+                    if d.get("proposal_id") == proposal_id:
+                        target_proposal = d
+                        break
+                except Exception:
+                    pass
+
+            if not target_proposal:
+                raise HTTPException(status_code=404, detail=f"Proposal {proposal_id} not found")
+
+            # Call generator /mitigate to enforce action
+            factor = float(target_proposal.get("params", {}).get("factor", 0.6))
+            duration = float(target_proposal.get("params", {}).get("duration_min", 30.0))
+            service = target_proposal.get("service", "all")
+
+            async with httpx.AsyncClient(timeout=settings.generator_timeout_s) as client:
+                resp = await client.post(
+                    f"{settings.generator_url}/mitigate",
+                    json={
+                        "service": service,
+                        "type": "rate_limit",
+                        "factor": factor,
+                        "duration_min": duration,
+                        "mitigation_id": proposal_id,
+                    },
+                )
+                if resp.status_code >= 400:
+                    raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+            # Update proposal status to APPLIED
+            target_proposal["status"] = "applied"
+            target_proposal["remediation_id"] = proposal_id
+            r.xadd(settings.redis_stream_proposals, {"payload": json.dumps(target_proposal)}, maxlen=10000)
+
+            return {"proposal_id": proposal_id, "status": "applied"}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.post("/api/remediation/proposals/{proposal_id}/reject")
+    async def reject_remediation_proposal(proposal_id: str):
+        """Reject a pending proposal."""
+        try:
+            import redis as redis_lib  # noqa: PLC0415
+            r = redis_lib.from_url(settings.redis_url, decode_responses=True)
+            raw = r.xrevrange(settings.redis_stream_proposals, count=100)
+            target_proposal = None
+            for _id, fields in raw:
+                try:
+                    d = json.loads(fields.get("payload", "{}"))
+                    if d.get("proposal_id") == proposal_id:
+                        target_proposal = d
+                        break
+                except Exception:
+                    pass
+
+            if target_proposal:
+                target_proposal["status"] = "rejected"
+                r.xadd(settings.redis_stream_proposals, {"payload": json.dumps(target_proposal)}, maxlen=10000)
+
+            return {"proposal_id": proposal_id, "status": "rejected"}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
 
     # -----------------------------------------------------------------------
     # Root — serve SPA

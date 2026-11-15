@@ -81,25 +81,56 @@ class ResetRequest(BaseModel):
     )
 
 
+class MitigateRequest(BaseModel):
+    service: str = Field(..., description="Target service name or 'all'")
+    type: str = Field(default="rate_limit", description="Mitigation type")
+    factor: float = Field(..., gt=0.0, le=1.0, description="Rate limit multiplier (0 < factor <= 1.0)")
+    duration_min: float = Field(..., gt=0.0, description="Duration in simulated minutes")
+    mitigation_id: Optional[str] = Field(default=None, description="Optional custom mitigation ID")
+
+    @field_validator("service")
+    @classmethod
+    def validate_service(cls, v: str) -> str:
+        if v != "all" and v not in VALID_SERVICE_NAMES:
+            raise ValueError(
+                f"Invalid service {v!r}. Valid: {sorted(VALID_SERVICE_NAMES)} or 'all'"
+            )
+        return v
+
+
+class MitigateResponse(BaseModel):
+    mitigation_id: str
+    service: str
+    type: str
+    factor: float
+    duration_min: float
+    status: str
+
+
 # ---------------------------------------------------------------------------
 # App factory  (called from main.py so clock/registry refs can be injected)
 # ---------------------------------------------------------------------------
 
 
-def create_app(clock, registry, publisher) -> FastAPI:
+def create_app(clock, registry, publisher, mitigation_registry=None) -> FastAPI:
     """
     Build the FastAPI application with shared references to the live
-    clock, injection registry, and publisher.
+    clock, injection registry, publisher, and mitigation registry.
 
     Parameters
     ----------
-    clock:      generator.clock.SimClock
-    registry:   generator.anomalies.InjectionRegistry
-    publisher:  generator.publisher.Publisher
+    clock:                generator.clock.SimClock
+    registry:             generator.anomalies.InjectionRegistry
+    publisher:            generator.publisher.Publisher
+    mitigation_registry:  generator.mitigations.MitigationRegistry
     """
+    if mitigation_registry is None:
+        from generator.mitigations import MitigationRegistry  # noqa: PLC0415
+        mitigation_registry = MitigationRegistry()
+
     app = FastAPI(
         title="CRIP Generator Control API",
-        description="Pause/resume/speed/inject controls for the CRIP simulation.",
+        description="Pause/resume/speed/inject/mitigate controls for the CRIP simulation.",
         version="1.0.0",
     )
 
@@ -158,6 +189,59 @@ def create_app(clock, registry, publisher) -> FastAPI:
         """List all injections (pending, active, ended)."""
         return registry.list_all()
 
+    # ----- Mitigation endpoints -----
+
+    @app.post("/mitigate", response_model=MitigateResponse, status_code=status.HTTP_201_CREATED)
+    def mitigate(body: MitigateRequest):
+        """Apply a rate-limit / throttle mitigation."""
+        from generator.mitigations import Mitigation  # noqa: PLC0415
+
+        mit_id = body.mitigation_id or str(uuid.uuid4())
+        m = Mitigation(
+            mitigation_id=mit_id,
+            service=body.service,
+            type=body.type,
+            factor=body.factor,
+            duration_min=body.duration_min,
+        )
+        mitigation_registry.add(m)
+
+        log.info(
+            "api_mitigate",
+            mitigation_id=mit_id,
+            service=body.service,
+            factor=body.factor,
+            duration_min=body.duration_min,
+            run_id=clock.run_id,
+            tick_index=clock.tick_index,
+        )
+        return MitigateResponse(
+            mitigation_id=mit_id,
+            service=body.service,
+            type=body.type,
+            factor=body.factor,
+            duration_min=body.duration_min,
+            status=m.status,
+        )
+
+    @app.delete("/mitigate/{mitigation_id}", status_code=status.HTTP_200_OK)
+    def delete_mitigation(mitigation_id: str):
+        """Remove / revert an active mitigation."""
+        sim_ts = clock.sim_ts
+        ok = mitigation_registry.end_early(mitigation_id, sim_ts)
+        if not ok:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Mitigation {mitigation_id!r} not found or already ended",
+            )
+        log.info("api_mitigate_delete", mitigation_id=mitigation_id, run_id=clock.run_id)
+        return {"mitigation_id": mitigation_id, "status": "ended"}
+
+    @app.get("/mitigations", status_code=status.HTTP_200_OK)
+    def list_mitigations():
+        """List all mitigations."""
+        return mitigation_registry.list_all()
+
     # ----- State endpoint -----
 
     @app.get("/state", status_code=status.HTTP_200_OK)
@@ -165,6 +249,7 @@ def create_app(clock, registry, publisher) -> FastAPI:
         """Return current simulation state."""
         state = clock.state_dict()
         state["active_injections"] = registry.active_ids()
+        state["active_mitigations"] = mitigation_registry.active_ids()
         return state
 
     # ----- Control endpoints -----
@@ -211,6 +296,7 @@ def create_app(clock, registry, publisher) -> FastAPI:
 
         new_run_id = clock.reset(seed=body.seed, sim_start_ts=sim_start)
         registry.clear_all()
+        mitigation_registry.clear_all()
         publisher.update_run_id(new_run_id)
 
         log.info("api_reset", new_run_id=new_run_id, seed=body.seed)

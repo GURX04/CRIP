@@ -79,10 +79,25 @@ class HistoryInjection(BaseModel):
     wall_start_ms: int = 0
 
 
+class HistoryProposal(BaseModel):
+    proposal_id: str
+    detection_id: str
+    service: str
+    classification: str
+    action: str
+    params: Dict[str, Any] = Field(default_factory=dict)
+    estimated_savings_hourly: float
+    estimated_risk: float
+    reason: str
+    status: str
+    sim_ts: Optional[str] = None
+
+
 class HistoryResponse(BaseModel):
     ticks: List[HistoryTick] = Field(default_factory=list)
     detections: List[HistoryDetection] = Field(default_factory=list)
     injections: List[HistoryInjection] = Field(default_factory=list)
+    proposals: List[HistoryProposal] = Field(default_factory=list)
     minutes: int
 
 
@@ -96,6 +111,14 @@ class InjectProxyRequest(BaseModel):
     magnitude: float = Field(gt=0)
     duration_min: float = Field(gt=0)
     ramp_min: float = Field(default=0.0, ge=0)
+
+
+class RemediationModeRequest(BaseModel):
+    mode: str  # DRY_RUN | ENFORCE
+
+
+class KillSwitchRequest(BaseModel):
+    enabled: bool
 
 
 class SpeedProxyRequest(BaseModel):

@@ -289,6 +289,31 @@ def eval_live(c, redis=""):
     c.run(f'"{PYTHON}" -m pipeline.evaluator{flags}', pty=False, in_stream=False)
 
 
+@task(help={
+    "suite": "Evaluation suite to run: quick (2 seeds, 1 day) | full (30 seeds, 7 days)",
+    "output": "Optional custom output directory path",
+})
+def eval_offline(c, suite="quick", output=""):
+    """Run the offline evaluation benchmark suite across seeds and scenarios."""
+    out_flag = f' --output "{output}"' if output else ""
+    print(f">>> [crip] Running offline evaluation benchmark (suite={suite})...")
+    c.run(f'"{PYTHON}" -m evaluation.cli benchmark --suite {suite}{out_flag}', pty=False, in_stream=False)
+
+
+@task(help={"quick": "Quick mode tuning on fewer seeds and iterations"})
+def eval_tune(c, quick=False):
+    """Run hyperparameter search and calibration strictly on TUNE seeds."""
+    quick_flag = " --quick" if quick else ""
+    print(">>> [crip] Running hyperparameter tuning on TUNE seeds...")
+    c.run(f'"{PYTHON}" -m evaluation.cli tune{quick_flag}', pty=False, in_stream=False)
+
+
+@task
+def eval_report(c):
+    """Display the latest offline evaluation report path and summary."""
+    c.run(f'"{PYTHON}" -m evaluation.cli report', pty=False, in_stream=False)
+
+
 @task(help={"date": "Report date YYYY-MM-DD", "interval": "Minutes per interval (default 5)"})
 def cur(c, date="2026-10-26", interval=5):
     """Generate synthetic AWS CUR CSV (reports/synthetic_cur.csv)."""
@@ -433,3 +458,52 @@ def pipeline(c, wait_seconds=20):
     print("  [SUCCESS] CRIP Pipeline completed successfully!")
     print("  * Report Plot : reports/forecast_plot.png")
     print("=" * 70)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Live Remediation Tasks
+# ---------------------------------------------------------------------------
+
+@task(help={"mode": "Operating mode: dry | enforce (default dry)"})
+def remediate_live(c, mode="dry"):
+    """Start the live streaming remediation worker."""
+    m_val = mode.upper()
+    if m_val not in ("DRY", "DRY_RUN", "ENFORCE"):
+        print(f"[ERROR] Invalid mode '{mode}'. Choose 'dry' or 'enforce'.")
+        return
+    mode_str = "ENFORCE" if m_val == "ENFORCE" else "DRY_RUN"
+    print(f">>> [crip] Starting remediation worker (mode={mode_str})...")
+    c.run(
+        f'"{PYTHON}" -m remediation.worker',
+        pty=False,
+        in_stream=False,
+        env={"REM_MODE": mode_str},
+    )
+
+
+@task(help={"mode": "Operating mode to set: dry | enforce"})
+def remediate_mode(c, mode="dry"):
+    """Switch remediation engine mode between dry-run and enforce."""
+    m_val = mode.upper()
+    mode_str = "ENFORCE" if m_val in ("ENFORCE", "REAL") else "DRY_RUN"
+    try:
+        import redis as _redis
+        r = _redis.from_url(os.getenv("REM_REDIS_URL", "redis://localhost:6379"), decode_responses=True)
+        r.set("crip:remediation:mode", mode_str)
+        print(f"[OK] Remediation mode updated in Redis: {mode_str}")
+    except Exception as exc:
+        print(f"[ERROR] Could not connect to Redis: {exc}")
+
+
+@task(help={"state": "Kill switch state: on | off (default on)"})
+def kill_switch(c, state="on"):
+    """Engage or disengage emergency kill switch (blocks all actions)."""
+    is_on = state.lower() in ("on", "true", "1", "enable")
+    try:
+        import redis as _redis
+        r = _redis.from_url(os.getenv("REM_REDIS_URL", "redis://localhost:6379"), decode_responses=True)
+        r.set("crip:remediation:kill_switch", "1" if is_on else "0")
+        status_str = "ENGAGED (all actions blocked)" if is_on else "DISENGAGED (normal operation)"
+        print(f"[OK] Remediation kill switch is now: {status_str}")
+    except Exception as exc:
+        print(f"[ERROR] Could not connect to Redis: {exc}")

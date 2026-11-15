@@ -36,6 +36,7 @@ from generator.config import GeneratorSettings, get_settings, reset_settings
 from generator.clock import SimClock
 from generator.traffic_model import TrafficModel
 from generator.anomalies import InjectionRegistry
+from generator.mitigations import MitigationRegistry
 from generator.publisher import Publisher
 from generator.api import create_app
 
@@ -154,11 +155,14 @@ def main(argv: Optional[list[str]] = None) -> None:
     rng = np.random.default_rng(settings.seed)
     traffic_model = TrafficModel(rng=rng, settings=settings)
     registry = InjectionRegistry()
+    mitigation_registry = MitigationRegistry()
     publisher = Publisher(settings=settings, run_id=clock.run_id)
 
-    # Wire ground-truth callbacks
+    # Wire ground-truth and mitigation callbacks
     registry.on_start(publisher.write_injection_start)
     registry.on_end(publisher.write_injection_end)
+    mitigation_registry.on_start(publisher.write_mitigation_start)
+    mitigation_registry.on_end(publisher.write_mitigation_end)
 
     log.info(
         "generator_starting",
@@ -173,7 +177,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     uvi_server: Optional[uvicorn.Server] = None
 
     if not args.no_api:
-        app = create_app(clock=clock, registry=registry, publisher=publisher)
+        app = create_app(
+            clock=clock,
+            registry=registry,
+            publisher=publisher,
+            mitigation_registry=mitigation_registry,
+        )
         uvi_config = uvicorn.Config(
             app=app,
             host=settings.api_host,
@@ -193,7 +202,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Tick loop — monotonic scheduler
     # -----------------------------------------------------------------------
     try:
-        _tick_loop(clock, traffic_model, registry, publisher, settings)
+        _tick_loop(clock, traffic_model, registry, mitigation_registry, publisher, settings)
     finally:
         log.info("generator_shutting_down", run_id=clock.run_id)
         if uvi_server:
@@ -206,6 +215,7 @@ def _tick_loop(
     clock: SimClock,
     traffic_model: TrafficModel,
     registry: InjectionRegistry,
+    mitigation_registry: MitigationRegistry,
     publisher: Publisher,
     settings: GeneratorSettings,
 ) -> None:
@@ -230,7 +240,10 @@ def _tick_loop(
         # 2. Apply anomaly injections
         tick_state = registry.apply_all(tick_state)
 
-        # 3. Publish events (and labels)
+        # 3. Apply active mitigations (rate limits / throttles)
+        tick_state = mitigation_registry.apply_all(tick_state)
+
+        # 4. Publish events (and labels)
         try:
             publisher.emit_tick(tick_state)
         except Exception as exc:

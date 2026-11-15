@@ -30,6 +30,9 @@ class DashboardSettings(BaseSettings):
     redis_stream_detections: str = Field(default="crip:detections")
     redis_stream_injections: str = Field(default="crip:injections")
     redis_stream_eval: str = Field(default="crip:eval")
+    redis_stream_proposals: str = Field(default="crip:remediation_proposals")
+    redis_stream_mitigations: str = Field(default="crip:mitigations")
+    redis_stream_results: str = Field(default="crip:remediation_results")
     redis_xread_count: int = Field(default=50, gt=0,
         description="Max messages per XREAD call per stream.")
     redis_block_ms: int = Field(default=200, ge=0,

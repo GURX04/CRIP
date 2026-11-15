@@ -152,6 +152,47 @@ class Publisher:
             run_id=self._run_id,
         )
 
+    def write_mitigation_start(self, mitigation) -> None:
+        """Record mitigation start to Redis stream."""
+        record = mitigation.to_dict()
+        record["event"] = "start"
+        record["run_id"] = self._run_id
+        self._mitigation_redis(record)
+        log.info(
+            "mitigation_started",
+            mitigation_id=mitigation.mitigation_id,
+            service=record["service"],
+            factor=record["factor"],
+            run_id=self._run_id,
+        )
+
+    def write_mitigation_end(self, mitigation) -> None:
+        """Record mitigation end to Redis stream."""
+        record = mitigation.to_dict()
+        record["event"] = "end"
+        record["run_id"] = self._run_id
+        self._mitigation_redis(record)
+        log.info(
+            "mitigation_ended",
+            mitigation_id=mitigation.mitigation_id,
+            service=record["service"],
+            run_id=self._run_id,
+        )
+
+    def _mitigation_redis(self, record: dict) -> None:
+        if self._redis is None:
+            return
+        try:
+            stream_name = getattr(self._settings, "redis_stream_mitigations", "crip:mitigations")
+            self._redis.xadd(
+                stream_name,
+                {"payload": json.dumps(record)},
+                maxlen=10_000,
+                approximate=True,
+            )
+        except Exception as exc:
+            log.error("mitigation_redis_failed", error=str(exc))
+
     def close(self) -> None:
         """Flush and close all open resources."""
         if self._csv_file:
@@ -226,7 +267,7 @@ class Publisher:
         """Connect to TimescaleDB for ground-truth injection records."""
         try:
             import psycopg2  # noqa: PLC0415
-            self._db_conn = psycopg2.connect(self._settings.db_dsn)
+            self._db_conn = psycopg2.connect(self._settings.db_dsn, connect_timeout=1)
             self._db_conn.autocommit = True
             log.info("timescaledb_connected")
         except Exception as exc:

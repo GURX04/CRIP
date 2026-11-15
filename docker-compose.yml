@@ -237,6 +237,33 @@ services:
       - crip_net
 
   # ----------------------------------------------------------
+  # Remediation: automated cost anomaly response engine
+  # ----------------------------------------------------------
+  remediation:
+    build:
+      context: .
+      dockerfile: pipeline/Dockerfile
+    container_name: remediation
+    restart: unless-stopped
+    command: ["python", "-m", "remediation.worker"]
+    environment:
+      - REM_MODE=DRY_RUN
+      - REM_REDIS_URL=redis://redis:6379
+      - REM_GENERATOR_URL=http://generator:8000
+      - REM_DB_DSN=postgresql://crip_user:crip_secret@timescaledb:5432/crip
+      - REM_LOCALSTACK_URL=http://localstack:4566
+    volumes:
+      - ./remediation:/app/remediation:ro
+      - ./pipeline:/app/pipeline:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      generator:
+        condition: service_healthy
+    networks:
+      - crip_net
+
+  # ----------------------------------------------------------
   # Dashboard: live demo UI + SSE fan-out backend
   # ----------------------------------------------------------
   dashboard:

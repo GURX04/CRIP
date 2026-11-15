@@ -73,7 +73,7 @@ class SSEClient {
       setTimeout(() => this._connect(), this._backoff);
       this._backoff = Math.min(this._backoff * 2, 30000);
     };
-    ['tick','detection','injection','eval','state','heartbeat'].forEach(ev => {
+    ['tick','detection','injection','eval','state','heartbeat','remediation_proposal','mitigation','remediation_result'].forEach(ev => {
       this._es.addEventListener(ev, e => {
         try { bus.emit(ev, JSON.parse(e.data)); }
         catch(err) { console.warn('SSE parse error', err); }
@@ -237,6 +237,7 @@ class ChartManager {
     bus.on('tick', d => this._onTick(d));
     bus.on('detection', d => this._onDetection(d));
     bus.on('injection', d => this._onInjection(d));
+    bus.on('mitigation', m => this._onMitigation(m));
 
     $('#gt-toggle').addEventListener('change', e => {
       this._showGT = e.target.checked;
@@ -318,6 +319,16 @@ class ChartManager {
     this._regions.push({ start, end, color });
     if (this._regions.length > 30) this._regions.shift();
 
+    this._dirtyTotal = true;
+    this._scheduleRender();
+  }
+
+  _onMitigation(m) {
+    const start = isoToEpoch(m.sim_start_ts);
+    const end = m.sim_end_ts ? isoToEpoch(m.sim_end_ts) : null;
+    const color = 'rgba(0, 200, 83, 0.25)';
+    this._regions.push({ start, end, color });
+    if (this._regions.length > 50) this._regions.shift();
     this._dirtyTotal = true;
     this._scheduleRender();
   }
@@ -655,6 +666,24 @@ class RCAPanel {
     if ($('#rca-cost-base'))   $('#rca-cost-base').textContent  = '$' + base1k.toFixed(4);
     if ($('#rca-pct-cost'))    $('#rca-pct-cost').textContent   = (pctCost >= 0 ? '+' : '') + pctCost.toFixed(1) + '%';
     if ($('#rca-pct-volume'))  $('#rca-pct-volume').textContent = (pctVol >= 0 ? '+' : '') + pctVol.toFixed(1) + '%';
+
+    // Proposed action display in RCA Card
+    const actionEl = $('#rca-remediation-action');
+    if (actionEl) {
+      if (cls === 'price_driven') {
+        actionEl.textContent = 'Proposed Action: No throttle recommended: price change';
+        actionEl.className = 'rca-remediation price-driven';
+      } else if (cls === 'traffic_driven') {
+        actionEl.textContent = 'Proposed Action: RateLimit / ConcurrencyCap proposed (traffic volume throttle)';
+        actionEl.className = 'rca-remediation';
+      } else if (cls === 'volume_drop_cost_flat') {
+        actionEl.textContent = 'Proposed Action: Alert-only capacity audit';
+        actionEl.className = 'rca-remediation';
+      } else {
+        actionEl.textContent = 'Proposed Action: —';
+        actionEl.className = 'rca-remediation';
+      }
+    }
   }
 }
 
@@ -744,9 +773,230 @@ function checkReplayMode() {
 }
 
 // ============================================================
+// Remediation Manager
+// ============================================================
+class RemediationManager {
+  constructor() {
+    this._proposals = [];
+    this._mode = 'DRY_RUN';
+    this._killSwitch = false;
+    this._totalSavings = 0.0;
+    this._renderPending = false;
+
+    bus.on('remediation_proposal', p => this._onProposal(p));
+    bus.on('mitigation', m => this._onMitigation(m));
+    bus.on('remediation_result', r => this._onResult(r));
+
+    this._bindControls();
+    this._fetchInitialState();
+  }
+
+  _bindControls() {
+    const btnMode = $('#btn-remed-mode');
+    const btnKill = $('#btn-kill-switch');
+    const modal = $('#enforce-modal');
+    const modalCancel = $('#modal-cancel-btn');
+    const modalConfirm = $('#modal-confirm-btn');
+
+    if (btnMode) {
+      btnMode.addEventListener('click', () => {
+        if (this._mode === 'DRY_RUN') {
+          if (modal) modal.classList.add('visible');
+        } else {
+          this._setMode('DRY_RUN');
+        }
+      });
+    }
+
+    if (modalCancel && modal) {
+      modalCancel.addEventListener('click', () => {
+        modal.classList.remove('visible');
+      });
+    }
+
+    if (modalConfirm && modal) {
+      modalConfirm.addEventListener('click', async () => {
+        modal.classList.remove('visible');
+        await this._setMode('ENFORCE');
+      });
+    }
+
+    if (btnKill) {
+      btnKill.addEventListener('click', async () => {
+        await this._setKillSwitch(!this._killSwitch);
+      });
+    }
+  }
+
+  async _fetchInitialState() {
+    try {
+      const state = await apiFetch('GET', '/api/remediation/state', null);
+      if (state) {
+        this._mode = state.mode || 'DRY_RUN';
+        this._killSwitch = !!state.kill_switch;
+        this._updateHeaderButtons();
+      }
+    } catch(e) {}
+  }
+
+  async _setMode(newMode) {
+    const res = await apiFetch('POST', '/api/remediation/mode', { mode: newMode });
+    if (res && res.mode) {
+      this._mode = res.mode;
+      this._updateHeaderButtons();
+      showToast('Remediation mode set to ' + res.mode, res.mode === 'ENFORCE' ? 'warn' : 'info');
+    }
+  }
+
+  async _setKillSwitch(enabled) {
+    const res = await apiFetch('POST', '/api/remediation/kill-switch', { enabled });
+    if (res && res.kill_switch !== undefined) {
+      this._killSwitch = res.kill_switch;
+      this._updateHeaderButtons();
+      showToast(
+        this._killSwitch ? 'Emergency Kill-Switch ENGAGED — All actions blocked!' : 'Kill-Switch Disengaged',
+        this._killSwitch ? 'error' : 'success'
+      );
+    }
+  }
+
+  _updateHeaderButtons() {
+    const btnMode = $('#btn-remed-mode');
+    if (btnMode) {
+      btnMode.textContent = `Mode: ${this._mode}`;
+      btnMode.className = `ctrl-btn ${this._mode === 'ENFORCE' ? 'danger' : ''}`;
+    }
+
+    const btnKill = $('#btn-kill-switch');
+    if (btnKill) {
+      btnKill.textContent = `Kill Switch: ${this._killSwitch ? 'ON' : 'OFF'}`;
+      btnKill.className = `ctrl-btn ${this._killSwitch ? 'kill-switch-active danger' : ''}`;
+    }
+
+    const savingsEl = $('#savings-counter');
+    if (savingsEl) {
+      savingsEl.textContent = `💰 Savings: $${this._totalSavings.toFixed(2)}`;
+    }
+  }
+
+  _onProposal(p) {
+    const idx = this._proposals.findIndex(x => x.proposal_id === p.proposal_id);
+    if (idx >= 0) {
+      this._proposals[idx] = p;
+    } else {
+      this._proposals.unshift(p);
+      if (this._proposals.length > 50) this._proposals.pop();
+    }
+
+    if (p.estimated_savings_hourly && p.status === 'applied') {
+      this._totalSavings += (p.estimated_savings_hourly / 12.0);
+      this._updateHeaderButtons();
+    }
+
+    this._scheduleRender();
+  }
+
+  _onMitigation(m) {
+    if (m.event === 'start') {
+      showToast(`Active mitigation applied to ${m.service} (factor=${m.factor})`, 'info');
+    } else if (m.event === 'end') {
+      showToast(`Mitigation ended for ${m.service}`, 'info');
+    }
+  }
+
+  _onResult(r) {
+    if (r.estimated_savings_usd) {
+      this._totalSavings += r.estimated_savings_usd;
+      this._updateHeaderButtons();
+    }
+  }
+
+  loadHistory(proposals) {
+    if (!proposals || !proposals.length) return;
+    this._proposals = [...proposals].reverse();
+    this._scheduleRender();
+  }
+
+  _scheduleRender() {
+    if (this._renderPending) return;
+    this._renderPending = true;
+    requestAnimationFrame(() => {
+      this._renderPending = false;
+      this._render();
+    });
+  }
+
+  _render() {
+    const tbody = $('#remediation-tbody');
+    const summary = $('#remed-status-summary');
+    if (!tbody) return;
+
+    if (this._proposals.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);font-size:0.85em;">No remediation proposals yet</td></tr>';
+      if (summary) summary.textContent = '0 active';
+      return;
+    }
+
+    const activeCount = this._proposals.filter(p => p.status === 'applied').length;
+    if (summary) summary.textContent = `${activeCount} applied / active`;
+
+    tbody.innerHTML = this._proposals.slice(0, 15).map(p => {
+      const timeStr = fmtSimTs(p.sim_ts);
+      const svc = SVC_SHORT[p.service] || p.service;
+      const act = (p.action || '').replace(/_/g, ' ');
+      const sav = '$' + (p.estimated_savings_hourly || 0).toFixed(2) + '/hr';
+      const risk = ((p.estimated_risk || 0) * 100).toFixed(0) + '%';
+      const statusCls = `badge-${p.status}`;
+      const statusLabel = (p.status || '').replace(/_/g, ' ');
+
+      let controls = '—';
+      if (p.status === 'pending_approval') {
+        controls = `
+          <button class="btn-approve" onclick="remediationManager.approve('${p.proposal_id}')">Approve</button>
+          <button class="btn-reject" onclick="remediationManager.reject('${p.proposal_id}')">Reject</button>
+        `;
+      }
+
+      return `
+        <tr title="${p.reason || ''}">
+          <td>${timeStr}</td>
+          <td><strong>${svc}</strong></td>
+          <td>${act}</td>
+          <td style="color:var(--c-ok);">${sav}</td>
+          <td>${risk}</td>
+          <td><span class="badge ${statusCls}">${statusLabel}</span></td>
+          <td>${controls}</td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  async approve(id) {
+    showToast(`Approving proposal ${id.slice(0, 8)}...`, 'info');
+    const res = await apiFetch('POST', `/api/remediation/proposals/${id}/approve`, {});
+    if (res && res.status === 'applied') {
+      showToast(`Proposal ${id.slice(0, 8)} applied in ENFORCE mode!`, 'success');
+      const p = this._proposals.find(x => x.proposal_id === id);
+      if (p) p.status = 'applied';
+      this._scheduleRender();
+    }
+  }
+
+  async reject(id) {
+    const res = await apiFetch('POST', `/api/remediation/proposals/${id}/reject`, {});
+    if (res && res.status === 'rejected') {
+      showToast(`Proposal ${id.slice(0, 8)} rejected.`, 'info');
+      const p = this._proposals.find(x => x.proposal_id === id);
+      if (p) p.status = 'rejected';
+      this._scheduleRender();
+    }
+  }
+}
+
+// ============================================================
 // Bootstrap
 // ============================================================
-let injectPanel, stopwatchPanel, alertFeed, rcaPanel, evalPanel, chartManager, topBar;
+let injectPanel, stopwatchPanel, alertFeed, rcaPanel, evalPanel, chartManager, topBar, remediationManager;
 
 document.addEventListener('DOMContentLoaded', async () => {
   checkReplayMode();
@@ -758,12 +1008,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   alertFeed    = new AlertFeed();
   rcaPanel     = new RCAPanel();
   evalPanel    = new EvalPanel();
+  remediationManager = new RemediationManager();
+  window.remediationManager = remediationManager;
 
   // Load history for chart restore
   const hist = await apiFetch('GET', '/history?minutes=60', null);
   if (hist) {
     chartManager.loadHistory(hist);
     alertFeed.loadHistory(hist.detections || []);
+    remediationManager.loadHistory(hist.proposals || []);
   }
 
   // Wire SSE bus to components

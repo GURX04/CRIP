@@ -136,6 +136,10 @@ class GeneratorSettings(BaseSettings):
         default="crip:injections",
         description="Redis stream name for injection lifecycle records.",
     )
+    redis_stream_mitigations: str = Field(
+        default="crip:mitigations",
+        description="Redis stream name for mitigation lifecycle records.",
+    )
     redis_maxlen: int = Field(
         default=100_000,
         gt=0,

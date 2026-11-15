@@ -1,0 +1,231 @@
+# CRIP Offline Evaluation Scenarios
+version: 1
+
+settings:
+  sim_interval_minutes: 5
+  warmup_ticks: 288           # 24 hours (288 x 5min) baseline before injections
+  tolerance_ticks: 2          # ± 2 ticks (10 min) detection window tolerance
+  default_duration_days: 7
+  services:
+    - "AmazonApiGateway"
+    - "EC2 Data Transfer"
+    - "DynamoDB"
+    - "CloudWatch Logs"
+    - "S3 PUT"
+
+splits:
+  tune_seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  test_seeds: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
+               111, 112, 113, 114, 115, 116, 117, 118, 119, 120,
+               121, 122, 123, 124, 125, 126, 127, 128, 129, 130]
+  quick_tune_seeds: [1]
+  quick_test_seeds: [101]
+
+suites:
+  quick:
+    duration_days: 1
+    scenarios:
+      - clean
+      - quick_spike
+      - quick_cost_only
+
+  full:
+    duration_days: 7
+    scenarios:
+      - clean
+      - hard_negatives
+      - mixed_low
+      - mixed_medium
+      - mixed_high
+      - all_service_surge
+      - slow_drift_suite
+      - seasonality_suite
+
+# Scenario Definitions
+scenarios:
+  clean:
+    description: "Zero injected anomalies over 7 days — evaluates pure false-alarm rate."
+    injections: []
+
+  hard_negatives:
+    description: "Legitimate traffic spikes (traffic + cost scale proportionally, unit price invariant). Should NOT trigger price-driven alerts."
+    hard_negatives:
+      - service: "AmazonApiGateway"
+        start_tick: 500
+        duration_ticks: 36
+        traffic_multiplier: 2.5
+      - service: "DynamoDB"
+        start_tick: 1100
+        duration_ticks: 48
+        traffic_multiplier: 3.0
+    injections: []
+
+  quick_spike:
+    description: "Quick single spike test."
+    injections:
+      - type: "spike"
+        service: "DynamoDB"
+        start_tick: 100
+        duration_min: 30
+        magnitude: 2.5
+        ramp_min: 5
+
+  quick_cost_only:
+    description: "Quick single cost-only anomaly test."
+    injections:
+      - type: "cost_only"
+        service: "AmazonApiGateway"
+        start_tick: 180
+        duration_min: 45
+        magnitude: 2.0
+        ramp_min: 0
+
+  mixed_low:
+    description: "Subtle anomalies with low magnitude (1.3x) across 7 days."
+    injections:
+      - type: "spike"
+        service: "DynamoDB"
+        start_tick: 350
+        duration_min: 30
+        magnitude: 1.3
+        ramp_min: 5
+      - type: "step_change"
+        service: "EC2 Data Transfer"
+        start_tick: 600
+        duration_min: 60
+        magnitude: 1.3
+        ramp_min: 0
+      - type: "slow_drift"
+        service: "CloudWatch Logs"
+        start_tick: 900
+        duration_min: 120
+        magnitude: 1.3
+        ramp_min: 30
+      - type: "cost_only"
+        service: "AmazonApiGateway"
+        start_tick: 1250
+        duration_min: 45
+        magnitude: 1.3
+        ramp_min: 0
+      - type: "seasonality_break"
+        service: "S3 PUT"
+        start_tick: 1550
+        duration_min: 90
+        magnitude: 1.3
+        ramp_min: 15
+
+  mixed_medium:
+    description: "Standard anomalies with moderate magnitude (2.0x) across 7 days."
+    injections:
+      - type: "spike"
+        service: "DynamoDB"
+        start_tick: 350
+        duration_min: 30
+        magnitude: 2.0
+        ramp_min: 5
+      - type: "step_change"
+        service: "EC2 Data Transfer"
+        start_tick: 600
+        duration_min: 60
+        magnitude: 2.0
+        ramp_min: 0
+      - type: "slow_drift"
+        service: "CloudWatch Logs"
+        start_tick: 900
+        duration_min: 120
+        magnitude: 2.0
+        ramp_min: 30
+      - type: "cost_only"
+        service: "AmazonApiGateway"
+        start_tick: 1250
+        duration_min: 45
+        magnitude: 2.0
+        ramp_min: 0
+      - type: "seasonality_break"
+        service: "S3 PUT"
+        start_tick: 1550
+        duration_min: 90
+        magnitude: 2.0
+        ramp_min: 15
+
+  mixed_high:
+    description: "High-magnitude anomalies (4.0x) across 7 days."
+    injections:
+      - type: "spike"
+        service: "DynamoDB"
+        start_tick: 350
+        duration_min: 30
+        magnitude: 4.0
+        ramp_min: 5
+      - type: "step_change"
+        service: "EC2 Data Transfer"
+        start_tick: 600
+        duration_min: 60
+        magnitude: 4.0
+        ramp_min: 0
+      - type: "slow_drift"
+        service: "CloudWatch Logs"
+        start_tick: 900
+        duration_min: 120
+        magnitude: 4.0
+        ramp_min: 30
+      - type: "cost_only"
+        service: "AmazonApiGateway"
+        start_tick: 1250
+        duration_min: 45
+        magnitude: 4.0
+        ramp_min: 0
+      - type: "seasonality_break"
+        service: "S3 PUT"
+        start_tick: 1550
+        duration_min: 90
+        magnitude: 4.0
+        ramp_min: 15
+
+  all_service_surge:
+    description: "Broad infrastructure incident affecting all services."
+    injections:
+      - type: "spike"
+        service: "all"
+        start_tick: 700
+        duration_min: 45
+        magnitude: 2.5
+        ramp_min: 10
+      - type: "step_change"
+        service: "all"
+        start_tick: 1400
+        duration_min: 60
+        magnitude: 2.0
+        ramp_min: 5
+
+  slow_drift_suite:
+    description: "Gradual infrastructure leaks (slow drift) over extended intervals."
+    injections:
+      - type: "slow_drift"
+        service: "DynamoDB"
+        start_tick: 400
+        duration_min: 180
+        magnitude: 2.0
+        ramp_min: 60
+      - type: "slow_drift"
+        service: "CloudWatch Logs"
+        start_tick: 1000
+        duration_min: 240
+        magnitude: 2.5
+        ramp_min: 60
+
+  seasonality_suite:
+    description: "Seasonality inversions and off-peak anomalies."
+    injections:
+      - type: "seasonality_break"
+        service: "AmazonApiGateway"
+        start_tick: 500
+        duration_min: 120
+        magnitude: 2.0
+        ramp_min: 20
+      - type: "seasonality_break"
+        service: "S3 PUT"
+        start_tick: 1200
+        duration_min: 180
+        magnitude: 2.5
+        ramp_min: 30

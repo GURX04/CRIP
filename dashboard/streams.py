@@ -123,6 +123,9 @@ class AsyncRedisReader:
             s.redis_stream_detections,
             s.redis_stream_injections,
             s.redis_stream_eval,
+            s.redis_stream_proposals,
+            s.redis_stream_mitigations,
+            s.redis_stream_results,
         ]
         # Start from "now" ($ = only new messages)
         ids = {stream: "$" for stream in streams}
@@ -205,6 +208,15 @@ class AsyncRedisReader:
 
         if stream == s.redis_stream_eval:
             return SSEMessage(event="eval", data=data)
+
+        if stream == s.redis_stream_proposals:
+            return SSEMessage(event="remediation_proposal", data=data)
+
+        if stream == s.redis_stream_mitigations:
+            return SSEMessage(event="mitigation", data=data)
+
+        if stream == s.redis_stream_results:
+            return SSEMessage(event="remediation_result", data=data)
 
         return None
 

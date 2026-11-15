@@ -24,6 +24,9 @@ pandas>=2.0
 prophet>=1.1.5
 matplotlib>=3.8
 sqlalchemy>=2.0
+scikit-learn>=1.4.0
+scipy>=1.12.0
+river>=0.27.0
 
 # Phase 4 — Continuous Event Generator
 fastapi>=0.111.0
