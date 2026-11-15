@@ -295,12 +295,18 @@ function timeline() {
           <line class="gl" x1="110" x2="880" y1="${y + 16}" y2="${y + 16}"/>`;
   });
 
+  let barCount = 0;
   S.det.forEach(d => {
     const i = SV.indexOf(d.svc);
-    if (i < 0 || d.end < t0) return;
+    if (i < 0) return;
+    const end = (d.status !== 'closed') ? Math.max(d.end, t1) : d.end;
+    if (end < t0) return;
+    barCount++;
+
     const y = 40 + i * 46;
-    const x = X(d.start);
-    const w = Math.max(8, X(Math.max(d.end, d.start)) - x);
+    const x = Math.max(110, X(d.start));
+    const xEnd = Math.min(880, X(end));
+    const w = Math.max(12, xEnd - x);
     const open = d.status !== 'closed';
     const hi = (d.sev || 0) >= 60;
 
@@ -312,9 +318,14 @@ function timeline() {
           </g>`;
   });
 
+  const emptyNote = (barCount === 0 && S.det.size > 0)
+    ? `<text x="495" y="150" text-anchor="middle" class="ax" style="font-size:13px">All ${S.det.size} incidents are outside the current ${S.range < 60 ? S.range + 'm' : (S.range / 60) + 'h'} window. Switch range to 24h or select an incident below.</text>`
+    : '';
+
   return `<svg viewBox="0 0 900 270" role="img" aria-label="Incident timeline">
     <text x="110" y="262" class="ax">${hm(t0)}</text>
     <text x="840" y="262" class="ax">${hm(t1)}</text>
+    ${emptyNote}
     ${g}
   </svg>
   <p class="muted" style="margin:4px 0 0;font-size:12px">Bars run from detection to resolution. Select a bar to open its incident.</p>`;
@@ -441,7 +452,8 @@ function render() {
 
   if (pg === 'intelligence') {
     set('c-tl', timeline());
-    const d = S.det.get(S.sel) || [...S.det.values()].at(-1);
+    const allDets = [...S.det.values()].sort((a, b) => b.start - a.start);
+    const d = S.det.get(S.sel) || allDets[0];
     set('i-det', d ? incCard(d, 1) : '<div class="empty">No incidents yet. Inject an anomaly to see one here.</div>');
 
     const r = (d && d.rca) || {};
@@ -451,7 +463,13 @@ function render() {
         <div class="stat"><span class="muted">Baseline</span><b>${usd(r.cost_per_1k_baseline)}</b></div>
       </div>
       <p style="margin:12px 0 6px"><b>Detectors that voted</b></p>
-      <p class="muted" style="margin:0">${esc(d.votes.join(', ') || '—')}</p>` : '<div class="empty">Select an incident.</div>');
+      <p class="muted" style="margin:0">${esc((d.votes || []).join(', ') || 'Ensemble consensus')}</p>
+      <div style="margin-top:14px">
+        <span class="muted" style="font-size:12px">Select incident (${allDets.length} total):</span>
+        <div class="row" style="margin-top:6px;gap:6px">
+          ${allDets.slice(0, 8).map(x => `<button class="chip${x.id === (d && d.id) ? ' on' : ''}" data-act="sel" data-id="${esc(x.id)}">${esc(LB[x.svc] || x.svc)} ${hm(x.start)}</button>`).join('')}
+        </div>
+      </div>` : '<div class="empty">Select an incident.</div>');
   }
 
   if (pg === 'remediation') {
@@ -629,7 +647,8 @@ document.addEventListener('click', e => {
   } else if (a === 'approve' || a === 'reject') {
     act(api('POST', `/api/remediation/proposals/${id}/${a}`), () => {
       const p = S.prop.get(id);
-      if (p) p.status = a === 'approve' ? 'approved' : 'rejected';
+      if (p) p.status = a === 'approve' ? 'applied' : 'rejected';
+      toast(a === 'approve' ? 'Mitigation approved & queued' : 'Proposal rejected');
       draw();
     });
   }

@@ -1,0 +1,12 @@
+{
+  "zscore_threshold": 3.5,
+  "ewma_k": 3.0,
+  "cpr_threshold": 3.5,
+  "k": 2,
+  "mean_f1": 0.02197802197802198,
+  "mean_fa_per_day": 12.714285714285714,
+  "grid_evaluations_count": 1,
+  "tune_seeds": [
+    1
+  ]
+}

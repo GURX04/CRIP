@@ -371,7 +371,7 @@ def create_app(settings: Optional[DashboardSettings] = None) -> FastAPI:
                 decode_responses=True,
             )
 
-            raw = r.xrevrange(settings.redis_stream_proposals, count=100)
+            raw = r.xrevrange(settings.redis_stream_proposals, count=2000)
             target_proposal = None
 
             for _id, fields in raw:
@@ -421,7 +421,7 @@ def create_app(settings: Optional[DashboardSettings] = None) -> FastAPI:
                 decode_responses=True,
             )
 
-            raw = r.xrevrange(settings.redis_stream_proposals, count=100)
+            raw = r.xrevrange(settings.redis_stream_proposals, count=2000)
             target_proposal = None
 
             for _id, fields in raw:

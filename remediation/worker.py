@@ -247,6 +247,17 @@ class RemediationWorker:
     ) -> bool:
         """Operator manually approves a pending proposal."""
 
+        if proposal_id not in self._active_proposals and self.redis:
+            try:
+                raw = self.redis.xrevrange(self.settings.redis_stream_proposals, count=1000)
+                for _id, fields in raw:
+                    p_data = json.loads(fields.get("payload", "{}"))
+                    if p_data.get("proposal_id") == proposal_id:
+                        self._active_proposals[proposal_id] = RemediationProposal.from_dict(p_data)
+                        break
+            except Exception as e:
+                log.warning("could_not_restore_proposal_from_redis: %s", e)
+
         if proposal_id not in self._active_proposals:
             log.warning(
                 "proposal_not_found_for_approval proposal_id=%s",
@@ -275,6 +286,17 @@ class RemediationWorker:
 
     def reject_proposal(self, proposal_id: str) -> bool:
         """Operator rejects a pending proposal."""
+
+        if proposal_id not in self._active_proposals and self.redis:
+            try:
+                raw = self.redis.xrevrange(self.settings.redis_stream_proposals, count=1000)
+                for _id, fields in raw:
+                    p_data = json.loads(fields.get("payload", "{}"))
+                    if p_data.get("proposal_id") == proposal_id:
+                        self._active_proposals[proposal_id] = RemediationProposal.from_dict(p_data)
+                        break
+            except Exception as e:
+                log.warning("could_not_restore_proposal_from_redis: %s", e)
 
         if proposal_id not in self._active_proposals:
             return False
