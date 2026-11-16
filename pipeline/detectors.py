@@ -138,6 +138,11 @@ class RobustZScoreDetector(StreamDetector):
         hour: int = event.sim_ts.hour
 
         # --- seasonal expected value from bucket EWMA ---
+        if hour not in self._seeded_hours:
+            # Cold bucket: seed with the first observation so the first visit
+            # to each hour-of-day does not look like a huge jump from zero.
+            self._hourly_ewma[hour] = cost
+            self._seeded_hours.add(hour)
         expected: float = self._hourly_ewma[hour]
         residual: float = cost - expected
 
@@ -187,6 +192,7 @@ class RobustZScoreDetector(StreamDetector):
     def _reset_state(self) -> None:
         # 24 hour-of-day EWMA buckets, initialised to zero.
         self._hourly_ewma: Dict[int, float] = {h: 0.0 for h in range(24)}
+        self._seeded_hours: set = set()
         # Rolling deque of raw residuals for robust statistics.
         self._residuals: Deque[float] = deque(maxlen=self._window if hasattr(self, "_window") else 20)
         # Consecutive ticks above threshold counter.
@@ -211,6 +217,7 @@ class EWMADetector(StreamDetector):
     """
 
     name: str = "ewma"
+    _STD_FLOOR_FRAC: float = 0.02
 
     def __init__(self, settings: PipelineSettings) -> None:
         self._alpha: float = settings.ewma_alpha
@@ -238,8 +245,20 @@ class EWMADetector(StreamDetector):
         cost: float = event.unblended_cost
         alpha: float = self._alpha
 
+        # --- Cold start: seed the baseline with the first observation ---
+        # (starting from 0.0 makes every normal event look anomalous until
+        # the EWMA has climbed up to the real cost level)
+        if not self._seeded:
+            self._ewma_cost = cost
+            self._seeded = True
+
         # --- Check control limit against current baseline ---
-        std: float = math.sqrt(max(self._ewma_var, 0.0))
+        # Floor the std at a small fraction of the level so perfectly flat
+        # traffic (var == 0) can still raise an alert on a real jump.
+        std: float = max(
+            math.sqrt(max(self._ewma_var, 0.0)),
+            self._STD_FLOOR_FRAC * abs(self._ewma_cost),
+        )
         upper: float = self._ewma_cost + self._k * std
         score: float = max(0.0, (cost - self._ewma_cost) / max(std, 1e-9)) if std > 0 else 0.0
         is_anomaly: bool = cost > upper if std > 0 else False
@@ -248,15 +267,23 @@ class EWMADetector(StreamDetector):
             f"upper={upper:.4f}, std={std:.4f}"
         )
 
-        # --- Update EWMA mean & variance ---
+        # --- Update EWMA mean & variance (winsorised) ---
+        # The innovation is clipped to +/- k*std before it enters the update.
+        # A real spike therefore moves the baseline only slowly (it keeps
+        # alerting for several ticks), but the baseline and variance never
+        # freeze: previously an anomalous tick skipped the variance update and
+        # damped the mean, so a normal diurnal ramp latched the detector into
+        # "anomaly" for hours.
         delta: float = cost - self._ewma_cost
-        if not is_anomaly:
-            self._ewma_cost += alpha * delta
-            self._ewma_var = (1.0 - alpha) * (self._ewma_var + alpha * delta ** 2)
+        if self._ewma_var > 0.0:
+            clip: float = self._k * std
+            delta_w: float = max(-clip, min(clip, delta))
         else:
-            # During an anomaly, update mean with heavily dampened alpha and avoid
-            # corrupting the baseline variance so the control chart stays active.
-            self._ewma_cost += (alpha * 0.1) * delta
+            # Variance not bootstrapped yet (e.g. first tick had cost 0):
+            # clipping to k*0 would freeze the baseline forever.
+            delta_w = delta
+        self._ewma_cost += alpha * delta_w
+        self._ewma_var = (1.0 - alpha) * (self._ewma_var + alpha * delta_w ** 2)
 
         return DetectorResult(
             detector_name=self.name,
@@ -276,6 +303,7 @@ class EWMADetector(StreamDetector):
     def _reset_state(self) -> None:
         self._ewma_cost: float = 0.0
         self._ewma_var: float = 0.0
+        self._seeded: bool = False
 
 
 # ---------------------------------------------------------------------------

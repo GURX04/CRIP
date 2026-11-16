@@ -255,10 +255,13 @@ class PipelineSettings(BaseSettings):
     # ------------------------------------------------------------------
 
     cooldown_ticks: int = Field(
-        default=1440,
+        default=12,
         description=(
             "After a Detection is emitted for a service, suppress further "
-            "detections on that service for this many ticks."
+            "detections on that service for this many ticks (1 tick = 5 "
+            "simulated minutes, so 12 = 1 simulated hour). The old default of "
+            "1440 ticks was 5 simulated days (~24 min of wall-clock at the "
+            "default speed) and silently swallowed every later anomaly."
         ),
         ge=0,
     )
